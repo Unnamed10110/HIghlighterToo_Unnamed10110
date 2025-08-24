@@ -1,0 +1,23 @@
+# Screen Highlighter Configuration File
+# Generated automatically - Do not edit manually
+
+# Configuración de opacidad del overlay (0-255)
+overlay_opacity=@overlay_opacity@
+
+# Factor de zoom mínimo (10-500)
+zoom_min_factor=@zoom_min_factor@
+
+# Factor de zoom máximo (50-1000)
+zoom_max_factor=@zoom_max_factor@
+
+# Velocidad de parpadeo del cursor de texto (ms)
+text_cursor_blink_speed=@text_cursor_blink_speed@
+
+# Grosor del borde de las regiones (1-10)
+region_border_thickness=@region_border_thickness@
+
+# Color del borde de las regiones (RGB)
+region_border_color=@region_border_color@
+
+# Habilitar hotkey Shift+Alt+X (1=habilitado, 0=deshabilitado)
+hotkey_shift_alt_x=@hotkey_shift_alt_x@

@@ -12,6 +12,11 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <memory>
+#include <stdexcept>
+#include <optional>
+// Headers de seguridad para verificación de permisos
+#include <windows.h>
 
 // Optimizaciones de compilador para máxima performance
 // Nota: Los pragmas específicos de MSVC no son compatibles con g++
@@ -19,8 +24,351 @@
 // Incluir librería de controles comunes para sliders
 // #pragma comment(lib, "comctl32.lib") // No soportado por g++
 
+// ============================================================================
+// CLASES RAII PARA GESTIÓN SEGURA DE RECURSOS GDI
+// ============================================================================
+
+// Clase RAII para HBITMAP - gestión automática de memoria
+class ScopedBitmap {
+    HBITMAP handle_;
+public:
+    ScopedBitmap() : handle_(nullptr) {}
+    explicit ScopedBitmap(HBITMAP h) : handle_(h) {}
+    ~ScopedBitmap() { 
+        if (handle_) DeleteObject(handle_); 
+    }
+    
+    // Constructor de movimiento
+    ScopedBitmap(ScopedBitmap&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+    
+    // Operador de asignación de movimiento
+    ScopedBitmap& operator=(ScopedBitmap&& other) noexcept {
+        if (this != &other) {
+            if (handle_) DeleteObject(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+    
+    // Eliminar copia
+    ScopedBitmap(const ScopedBitmap&) = delete;
+    ScopedBitmap& operator=(const ScopedBitmap&) = delete;
+    
+    // Operadores de conversión
+    operator HBITMAP() const { return handle_; }
+    HBITMAP get() const { return handle_; }
+    
+    // Liberar el handle (transferir propiedad)
+    HBITMAP release() {
+        HBITMAP h = handle_;
+        handle_ = nullptr;
+        return h;
+    }
+    
+    // Verificar si es válido
+    explicit operator bool() const { return handle_ != nullptr; }
+    
+    // Asignar nuevo handle
+    void reset(HBITMAP h = nullptr) {
+        if (handle_) DeleteObject(handle_);
+        handle_ = h;
+    }
+};
+
+// Clase RAII para HDC - gestión automática de contexto de dispositivo
+class ScopedDC {
+    HDC handle_;
+    bool should_delete_;
+public:
+    ScopedDC() : handle_(nullptr), should_delete_(false) {}
+    explicit ScopedDC(HDC h, bool delete_on_destroy = false) 
+        : handle_(h), should_delete_(delete_on_destroy) {}
+    ~ScopedDC() { 
+        if (handle_ && should_delete_) DeleteDC(handle_); 
+    }
+    
+    // Constructor de movimiento
+    ScopedDC(ScopedDC&& other) noexcept 
+        : handle_(other.handle_), should_delete_(other.should_delete_) {
+        other.handle_ = nullptr;
+        other.should_delete_ = false;
+    }
+    
+    // Operador de asignación de movimiento
+    ScopedDC& operator=(ScopedDC&& other) noexcept {
+        if (this != &other) {
+            if (handle_ && should_delete_) DeleteDC(handle_);
+            handle_ = other.handle_;
+            should_delete_ = other.should_delete_;
+            other.handle_ = nullptr;
+            other.should_delete_ = false;
+        }
+        return *this;
+    }
+    
+    // Eliminar copia
+    ScopedDC(const ScopedDC&) = delete;
+    ScopedDC& operator=(const ScopedDC&) = delete;
+    
+    // Operadores de conversión
+    operator HDC() const { return handle_; }
+    HDC get() const { return handle_; }
+    
+    // Liberar el handle (transferir propiedad)
+    HDC release() {
+        HDC h = handle_;
+        handle_ = nullptr;
+        should_delete_ = false;
+        return h;
+    }
+    
+    // Verificar si es válido
+    explicit operator bool() const { return handle_ != nullptr; }
+    
+    // Asignar nuevo handle
+    void reset(HDC h = nullptr, bool delete_on_destroy = false) {
+        if (handle_ && should_delete_) DeleteDC(handle_);
+        handle_ = h;
+        should_delete_ = delete_on_destroy;
+    }
+};
+
+// Clase RAII para HICON - gestión automática de iconos
+class ScopedIcon {
+    HICON handle_;
+public:
+    ScopedIcon() : handle_(nullptr) {}
+    explicit ScopedIcon(HICON h) : handle_(h) {}
+    ~ScopedIcon() { 
+        if (handle_) DestroyIcon(handle_); 
+    }
+    
+    // Constructor de movimiento
+    ScopedIcon(ScopedIcon&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+    
+    // Operador de asignación de movimiento
+    ScopedIcon& operator=(ScopedIcon&& other) noexcept {
+        if (this != &other) {
+            if (handle_) DestroyIcon(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+    
+    // Eliminar copia
+    ScopedIcon(const ScopedIcon&) = delete;
+    ScopedIcon& operator=(const ScopedIcon&) = delete;
+    
+    // Operadores de conversión
+    operator HICON() const { return handle_; }
+    HICON get() const { return handle_; }
+    
+    // Liberar el handle (transferir propiedad)
+    HICON release() {
+        HICON h = handle_;
+        handle_ = nullptr;
+        return h;
+    }
+    
+    // Verificar si es válido
+    explicit operator bool() const { return handle_ != nullptr; }
+    
+    // Asignar nuevo handle
+    void reset(HICON h = nullptr) {
+        if (handle_) DestroyIcon(handle_);
+        handle_ = h;
+    }
+};
+
+// Clase RAII para HBRUSH - gestión automática de pinceles
+class ScopedBrush {
+    HBRUSH handle_;
+    bool should_delete_;
+public:
+    ScopedBrush() : handle_(nullptr), should_delete_(false) {}
+    explicit ScopedBrush(HBRUSH h, bool delete_on_destroy = false) 
+        : handle_(h), should_delete_(delete_on_destroy) {}
+    ~ScopedBrush() { 
+        if (handle_ && should_delete_) DeleteObject(handle_); 
+    }
+    
+    // Constructor de movimiento
+    ScopedBrush(ScopedBrush&& other) noexcept 
+        : handle_(other.handle_), should_delete_(other.should_delete_) {
+        other.handle_ = nullptr;
+        other.should_delete_ = false;
+    }
+    
+    // Operador de asignación de movimiento
+    ScopedBrush& operator=(ScopedBrush&& other) noexcept {
+        if (this != &other) {
+            if (handle_ && should_delete_) DeleteObject(handle_);
+            handle_ = other.handle_;
+            should_delete_ = other.should_delete_;
+            other.handle_ = nullptr;
+            other.should_delete_ = false;
+        }
+        return *this;
+    }
+    
+    // Eliminar copia
+    ScopedBrush(const ScopedBrush&) = delete;
+    ScopedBrush& operator=(const ScopedBrush&) = delete;
+    
+    // Operadores de conversión
+    operator HBRUSH() const { return handle_; }
+    HBRUSH get() const { return handle_; }
+    
+    // Liberar el handle (transferir propiedad)
+    HBRUSH release() {
+        HBRUSH h = handle_;
+        handle_ = nullptr; 
+        should_delete_ = false;
+        return h; 
+    }
+    
+    // Verificar si es válido
+    explicit operator bool() const { return handle_ != nullptr; }
+    
+    // Asignar nuevo handle
+    void reset(HBRUSH h = nullptr, bool delete_on_destroy = false) {
+        if (handle_ && should_delete_) DeleteObject(handle_);
+        handle_ = h;
+        should_delete_ = false;
+    }
+};
+
+// Clase RAII para HPEN - gestión automática de plumas
+class ScopedPen {
+    HPEN handle_;
+public:
+    ScopedPen() : handle_(nullptr) {}
+    explicit ScopedPen(HPEN h) : handle_(h) {}
+    ~ScopedPen() { 
+        if (handle_) DeleteObject(handle_); 
+    }
+    
+    // Constructor de movimiento
+    ScopedPen(ScopedPen&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+    
+    // Operador de asignación de movimiento
+    ScopedPen& operator=(ScopedPen&& other) noexcept {
+        if (this != &other) {
+            if (handle_) DeleteObject(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+    
+    // Eliminar copia
+    ScopedPen(const ScopedPen&) = delete;
+    ScopedPen& operator=(const ScopedPen&) = delete;
+    
+    // Operadores de conversión
+    operator HPEN() const { return handle_; }
+    HPEN get() const { return handle_; }
+    
+    // Liberar el handle (transferir propiedad)
+    HPEN release() {
+        HPEN h = handle_;
+        handle_ = nullptr;
+        return h;
+    }
+    
+    // Verificar si es válido
+    explicit operator bool() const { return handle_ != nullptr; }
+    
+    // Asignar nuevo handle
+    void reset(HPEN h = nullptr) {
+        if (handle_) DeleteObject(handle_);
+        handle_ = h;
+    }
+};
+
+// Clase RAII para HFONT - gestión automática de fuentes
+class ScopedFont {
+    HFONT handle_;
+public:
+    ScopedFont() : handle_(nullptr) {}
+    explicit ScopedFont(HFONT h) : handle_(h) {}
+    ~ScopedFont() { 
+        if (handle_) DeleteObject(handle_); 
+    }
+    
+    // Constructor de movimiento
+    ScopedFont(ScopedFont&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+    
+    // Operador de asignación de movimiento
+    ScopedFont& operator=(ScopedFont&& other) noexcept {
+        if (this != &other) {
+            if (handle_) DeleteObject(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+    
+    // Eliminar copia
+    ScopedFont(const ScopedFont&) = delete;
+    ScopedFont& operator=(const ScopedFont&) = delete;
+    
+    // Operadores de conversión
+    operator HFONT() const { return handle_; }
+    HFONT get() const { return handle_; }
+    
+    // Liberar el handle (transferir propiedad)
+    HFONT release() {
+        HFONT h = handle_;
+        handle_ = nullptr;
+        return h;
+    }
+    
+    // Verificar si es válido
+    explicit operator bool() const { return handle_ != nullptr; }
+    
+    // Asignar nuevo handle
+    void reset(HFONT h = nullptr) {
+        if (handle_) DeleteObject(handle_);
+        handle_ = h;
+    }
+};
+
+// ============================================================================
+// ENUMERACIONES TIPO-SEGURAS PARA REEMPLAZAR MAGIC NUMBERS
+// ============================================================================
+
+// Enumeración para herramientas de dibujo (reemplaza magic numbers)
+enum class DrawingTool : uint8_t {
+    None = 0,
+    Line = 1,
+    Arrow = 2,
+    Rectangle = 3,
+    Text = 4,        // Mantenido para compatibilidad
+    Highlighter = 5
+};
+
+// Enumeración para tipos de mensajes personalizados
+enum class CustomMessage : UINT {
+    Taskbar = WM_USER + 1
+};
+
+// ============================================================================
+// CONSTANTES Y CONFIGURACIÓN
+// ============================================================================
+
 // Configuración optimizada integrada con constantes de performance
-constexpr UINT WM_TASKBAR = WM_USER + 1;
+constexpr UINT WM_TASKBAR = static_cast<UINT>(CustomMessage::Taskbar);
 constexpr int TRAY_ICON_ID = 1;
 constexpr int TRAY_ICON_SMALL = 16;
 constexpr int TRAY_ICON_LARGE = 32;
@@ -33,10 +381,12 @@ constexpr wchar_t MENU_ACTIVATE_TEXT[] = L"Activate Highlight (Shift+Alt+X)";
 constexpr wchar_t MENU_EXIT_TEXT[] = L"Exit";
 constexpr wchar_t MENU_SEPARATOR_TEXT[] = L"";
 
-
-
 // Nombre del archivo de configuración
 constexpr const char* CONFIG_FILE = "ScreenHighlighter.ini";
+
+// ============================================================================
+// VARIABLES GLOBALES CON MEJORAS DE SEGURIDAD
+// ============================================================================
 
 // Variables globales para el estado del programa
 std::atomic<bool> running(true);
@@ -53,8 +403,10 @@ std::atomic<float> zoom_factor(1.0f);
 std::atomic<bool> zoom_active(false);
 std::atomic<int> zoom_center_x(0);
 std::atomic<int> zoom_center_y(0);
-HBITMAP hZoomedBitmap = NULL; // Bitmap capturado una sola vez
-HDC hZoomedDC = NULL; // DC para el bitmap capturado
+
+// Reemplazar HBITMAP y HDC raw con clases RAII
+ScopedBitmap hZoomedBitmap;
+ScopedDC hZoomedDC;
 
 // Variables para texto en zoom
 std::atomic<bool> text_input_mode(false);
@@ -65,7 +417,7 @@ std::atomic<int> text_selection_start(-1);
 std::atomic<int> text_selection_end(-1);
 std::atomic<bool> text_selection_active(false);
 // Sistema simple para manejar imágenes del clipboard
-std::vector<HBITMAP> clipboard_images;
+std::vector<ScopedBitmap> clipboard_images;
 std::vector<std::wstring> image_markers; // Marcadores en el texto
 // El texto se maneja en una variable global simple (no atómica)
 std::wstring zoom_text;
@@ -85,7 +437,7 @@ std::atomic<int> scroll_pos(0);
 std::atomic<int> scroll_max(1000);  // Contenido total alto
 
 // Variables para herramientas de dibujo
-std::atomic<int> current_drawing_tool(0); // 0=none, 1=linea, 2=flecha, 3=rectangulo, 4=texto, 5=resaltador
+std::atomic<DrawingTool> current_drawing_tool{DrawingTool::None};
 std::atomic<int> drawing_color(RGB(255, 0, 0)); // Color rojo por defecto
 std::atomic<int> drawing_thickness(3); // Grosor de línea
 std::atomic<bool> drawing_fill(false); // Relleno para formas
@@ -103,14 +455,14 @@ std::atomic<int> screenshot_end_y(-1);
 
 // Estructura para elementos dibujados
 struct DrawingElement {
-    int tool_type;
+    DrawingTool tool_type;
     int x1, y1, x2, y2;
     COLORREF color;
     int thickness;
     bool filled;
     std::wstring text; // Para texto libre
     
-    DrawingElement(int type, int x1, int y1, int x2, int y2, COLORREF col, int thick, bool fill, const std::wstring& txt = L"")
+    DrawingElement(DrawingTool type, int x1, int y1, int x2, int y2, COLORREF col, int thick, bool fill, const std::wstring& txt = L"")
         : tool_type(type), x1(x1), y1(y1), x2(x2), y2(y2), color(col), thickness(thick), filled(fill), text(txt) {}
 };
 
@@ -128,6 +480,9 @@ struct ScreenRectangle {
 };
 
 std::vector<ScreenRectangle> screenRectangles;
+
+// Variable global para el handle de la ventana overlay
+HWND hCurrentOverlay = NULL;
 
 // Función para cargar configuración desde archivo .ini
 void LoadConfiguration() {
@@ -249,7 +604,7 @@ bool AddImageElement() {
                                               hdcClipboard, 0, 0, SRCCOPY)) {
                                         
                                         // Agregar a la lista de imágenes
-                                        clipboard_images.push_back(hNewBitmap);
+                                        clipboard_images.push_back(ScopedBitmap(hNewBitmap));
                                         
                                         // Agregar marcador de imagen en el texto (índice correcto) - optimizado
                                         const int imageIndex = (int)clipboard_images.size() - 1;
@@ -295,14 +650,14 @@ bool AddImageElement() {
                                         
                                         success = true;
                                     } else {
-                                        DeleteObject(hNewBitmap);
+                                        clipboard_images.back().reset();
                                     }
                                     
                                     // Limpiar DC temporal
                                     SelectObject(hdcClipboard, hOldClipboard);
                                     DeleteDC(hdcClipboard);
                                 } else {
-                                    DeleteObject(hNewBitmap);
+                                    clipboard_images.back().reset();
                                 }
                                 
                                 SelectObject(hdcMem, hOldBitmap);
@@ -334,72 +689,63 @@ HICON LoadIconFromFile(int size) {
         LR_LOADFROMFILE                  // Cargar desde archivo
     );
     
-    // Si falla la carga, crear un icono por defecto
+    // Si falla la carga, usar un icono del sistema como fallback
     if (!hIcon) {
-        // Crear un DC de memoria para dibujar el icono por defecto
-        HDC hdc = CreateCompatibleDC(NULL);
-        HBITMAP hBitmap = CreateCompatibleBitmap(hdc, size, size);
-        HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdc, hBitmap);
-        
-        // Rellenar el fondo con transparencia
-        RECT rect = {0, 0, size, size};
-        HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(hdc, &rect, hBrush);
-        DeleteObject(hBrush);
-        
-        // Dibujar un círculo verde #00FF44 como fallback
-        HBRUSH hGreenBrush = CreateSolidBrush(RGB(0, 255, 68));
-        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 255, 68));
-        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-        HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hGreenBrush);
-        
-        // Dibujar el círculo
-        int radius = size / 2 - 4;
-        int center = size / 2;
-        Ellipse(hdc, center - radius, center - radius, center + radius, center + radius);
-        
-        // Limpiar recursos
-        SelectObject(hdc, hOldPen);
-        SelectObject(hdc, hOldBrush);
-        DeleteObject(hGreenBrush);
-        DeleteObject(hPen);
-        
-        // Crear el icono desde el bitmap
-        ICONINFO ii;
-        ii.fIcon = TRUE;
-        ii.hbmColor = hBitmap;
-        ii.hbmMask = hBitmap;
-        
-        hIcon = CreateIconIndirect(&ii);
-        
-        // Limpiar recursos
-        SelectObject(hdc, hOldBitmap);
-        DeleteObject(hBitmap);
-        DeleteDC(hdc);
+        hIcon = LoadIcon(NULL, IDI_APPLICATION);
     }
     
     return hIcon;
 }
 
 // Función para agregar el icono al system tray
-void AddToSystemTray() {
+bool AddToSystemTray() {
+    printf("  🖼️ Configurando icono del system tray...\n");
+    
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
     nid.hWnd = hMainWnd;
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TASKBAR;
-    nid.hIcon = LoadIconFromFile(TRAY_ICON_SMALL);
-    strcpy_s(nid.szTip, TRAY_TOOLTIP_TEXT);
     
-    Shell_NotifyIcon(NIM_ADD, &nid);
+    // Cargar icono con gestión automática de memoria
+    printf("  🖼️ Cargando icono personalizado...\n");
+    ScopedIcon hIcon(LoadIconFromFile(TRAY_ICON_SMALL));
+    if (!hIcon) {
+        // Si falla la carga del icono, usar un icono por defecto del sistema
+        printf("  ⚠️ Usando icono por defecto del sistema\n");
+        nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    } else {
+        printf("  ✅ Icono personalizado cargado\n");
+        nid.hIcon = hIcon.release(); // Transferir propiedad al nid
+    }
+    
+    strcpy_s(nid.szTip, TRAY_TOOLTIP_TEXT);
+    printf("  💬 Tooltip configurado: %s\n", TRAY_TOOLTIP_TEXT);
+    
+    printf("  🔧 Agregando icono al system tray...\n");
+    if (!Shell_NotifyIcon(NIM_ADD, &nid)) {
+        // Manejar error de notificación
+        printf("  ❌ Error al agregar icono al system tray\n");
+        OutputDebugStringW(L"Error al agregar icono al system tray\n");
+        return false;
+    }
+    
+    printf("  ✅ Icono agregado exitosamente al system tray\n");
+    return true;
 }
 
 // Función para remover el icono del system tray
 void RemoveFromSystemTray() {
-    Shell_NotifyIcon(NIM_DELETE, &nid);
+    if (!Shell_NotifyIcon(NIM_DELETE, &nid)) {
+        // Manejar error de eliminación
+        OutputDebugStringW(L"Error al remover icono del system tray\n");
+    }
+    
+    // Limpiar el icono si existe
     if (nid.hIcon) {
         DestroyIcon(nid.hIcon);
+        nid.hIcon = nullptr;
     }
 }
 
@@ -419,19 +765,18 @@ void ShowTrayMenu() {
     DestroyMenu(hMenu);
 }
 
-// Variable global para el handle de la ventana overlay
-HWND hCurrentOverlay = NULL;
-
 // Función para dibujar línea
 void DrawLine(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thickness) {
-    HPEN hPen = CreatePen(PS_SOLID, thickness, color);
+    ScopedPen hPen(CreatePen(PS_SOLID, thickness, color));
+    if (!hPen) return; // Verificar que se creó correctamente
+    
     HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
     
     MoveToEx(hdc, x1, y1, NULL);
     LineTo(hdc, x2, y2);
     
     SelectObject(hdc, hOldPen);
-    DeleteObject(hPen);
+    // hPen se limpia automáticamente al salir del scope
 }
 
 // Función para dibujar flecha
@@ -462,17 +807,25 @@ void DrawArrow(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thic
 
 // Función para dibujar rectángulo
 void DrawRectangle(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thickness, bool filled) {
-    HPEN hPen = CreatePen(PS_SOLID, thickness, color);
+    ScopedPen hPen(CreatePen(PS_SOLID, thickness, color));
+    if (!hPen) return; // Verificar que se creó correctamente
+    
     HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-    HBRUSH hBrush = filled ? CreateSolidBrush(color) : (HBRUSH)GetStockObject(NULL_BRUSH);
-    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrush);
+    
+    // Crear pincel solo si es necesario (filled = true)
+    ScopedBrush hBrush;
+    if (filled) {
+        hBrush.reset(CreateSolidBrush(color), true);
+        if (!hBrush) return; // Verificar que se creó correctamente
+    }
+    
+    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, filled ? hBrush : GetStockObject(NULL_BRUSH));
     
     Rectangle(hdc, x1, y1, x2, y2);
     
     SelectObject(hdc, hOldPen);
     SelectObject(hdc, hOldBrush);
-    DeleteObject(hPen);
-    if (filled) DeleteObject(hBrush);
+    // hPen y hBrush se limpian automáticamente al salir del scope
 }
 
 // Función para reproducir sonido de captura
@@ -657,7 +1010,9 @@ void DrawHighlighter(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color) {
     COLORREF yellowColor = RGB(255, 255, 25); // Amarillo casi opaco
     
     // Crear pincel amarillo casi opaco
-    HBRUSH hBrush = CreateSolidBrush(yellowColor);
+    ScopedBrush hBrush(CreateSolidBrush(yellowColor), true);
+    if (!hBrush) return; // Verificar que se creó correctamente
+    
     HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrush);
     
     // Configurar modo de mezcla para crear transparencia real
@@ -671,7 +1026,7 @@ void DrawHighlighter(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color) {
     SetROP2(hdc, oldROP);
     
     SelectObject(hdc, hOldBrush);
-    DeleteObject(hBrush);
+    // hBrush se limpia automáticamente al salir del scope
 }
 
 // Función para dibujar el overlay
@@ -694,12 +1049,18 @@ void DrawOverlay(HDC hdc, int width, int height) {
     }
     
     // Crear DC de memoria para doble buffering
-    HDC hMemDC = CreateCompatibleDC(hdc);
-    HBITMAP hBitmap = CreateCompatibleBitmap(hdc, width, height);
+    ScopedDC hMemDC(CreateCompatibleDC(hdc), true);
+    if (!hMemDC) return; // Verificar que se creó correctamente
+    
+    ScopedBitmap hBitmap(CreateCompatibleBitmap(hdc, width, height));
+    if (!hBitmap) return; // Verificar que se creó correctamente
+    
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
     
     // Dibujar overlay negro en toda la pantalla
-    HBRUSH hOverlayBrush = CreateSolidBrush(RGB(0, 0, 0));
+    ScopedBrush hOverlayBrush(CreateSolidBrush(RGB(0, 0, 0)), true);
+    if (!hOverlayBrush) return; // Verificar que se creó correctamente
+    
     RECT fullRect = {0, 0, width, height};
     FillRect(hMemDC, &fullRect, hOverlayBrush);
     
@@ -708,7 +1069,9 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Cuando drawing_active es true, usar un color que bloquee la interactividad pero sea transparente
         // Cuando drawing_active es false, usar magenta que es completamente transparente
         COLORREF regionColor = drawing_active.load() ? RGB(0, 255, 255) : RGB(255, 0, 255);
-        HBRUSH hRegionBrush = CreateSolidBrush(regionColor);
+        ScopedBrush hRegionBrush(CreateSolidBrush(regionColor), true);
+        if (!hRegionBrush) return; // Verificar que se creó correctamente
+        
         HBRUSH hOldBrush = (HBRUSH)SelectObject(hMemDC, hRegionBrush);
         
         // Regiones guardadas - completamente transparentes
@@ -734,7 +1097,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         }
         
         SelectObject(hMemDC, hOldBrush);
-        DeleteObject(hRegionBrush);
+        // hRegionBrush se limpia automáticamente al salir del scope
     }
     
     // Dibujar zoom de la última región (si está activo)
@@ -761,16 +1124,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
         
         // Primero dibujar un fondo blanco sólido para el zoom (brillo normal)
         RECT zoomRect = {zoomX, zoomY, zoomX + zoomedWidth, zoomY + zoomedHeight};
-        HBRUSH hWhiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+        ScopedBrush hWhiteBrush(CreateSolidBrush(RGB(255, 255, 255)), true);
+        if (!hWhiteBrush) return; // Verificar que se creó correctamente
+        
         FillRect(hMemDC, &zoomRect, hWhiteBrush);
-        DeleteObject(hWhiteBrush);
         
         // Debug: verificar que el StretchBlt funcione
         // IMPORTANTE: Seleccionar el bitmap antes de hacer StretchBlt
-        HBITMAP hOldBitmap = (HBITMAP)SelectObject(hZoomedDC, hZoomedBitmap);
+        HBITMAP hOldBitmap = (HBITMAP)SelectObject(hZoomedDC.get(), hZoomedBitmap.get());
         
         BOOL stretchResult = StretchBlt(hMemDC, zoomX, zoomY, zoomedWidth, zoomedHeight,
-                                       hZoomedDC, 0, 0, originalWidth, originalHeight, SRCCOPY);
+                                       hZoomedDC.get(), 0, 0, originalWidth, originalHeight, SRCCOPY);
         if (!stretchResult) {
             wchar_t errorMsg[256];
             swprintf_s(errorMsg, L"DEBUG: StretchBlt falló - Error: %d\n", GetLastError());
@@ -780,7 +1144,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         }
         
         // Restaurar el bitmap anterior
-        SelectObject(hZoomedDC, hOldBitmap);
+        SelectObject(hZoomedDC.get(), hOldBitmap);
         
         // Dibujar texto debajo de la región con zoom
         if (!zoom_text.empty()) {
@@ -890,7 +1254,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                 int imageIndex = std::stoi(imageIndexStr);
                                 if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
                                     // Dibujar la imagen
-                                    HBITMAP hImage = clipboard_images[imageIndex];
+                                    HBITMAP hImage = clipboard_images[imageIndex].get();
                                     BITMAP bm;
                                     
                                     if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
@@ -1059,7 +1423,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                     try {
                                         int imageIndex = std::stoi(imageIndexStr);
                                         if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                            HBITMAP hImage = clipboard_images[imageIndex];
+                                            HBITMAP hImage = clipboard_images[imageIndex].get();
                                             BITMAP bm;
                                             if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
                                                 // El cursor debe estar después de la imagen
@@ -1093,7 +1457,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                     try {
                                         int imageIndex = std::stoi(imageIndexStr);
                                         if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                            HBITMAP hImage = clipboard_images[imageIndex];
+                                            HBITMAP hImage = clipboard_images[imageIndex].get();
                                             BITMAP bm;
                                             if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
                                                 // IMPORTANTE: Actualizar currentY con la altura real de la imagen
@@ -1353,7 +1717,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                 try {
                                     int imageIndex = std::stoi(imageIndexStr);
                                     if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                        HBITMAP hImage = clipboard_images[imageIndex];
+                                        HBITMAP hImage = clipboard_images[imageIndex].get();
                                         BITMAP bm;
                                         if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
                                             // El cursor debe estar después de la imagen
@@ -1387,7 +1751,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                 try {
                                     int imageIndex = std::stoi(imageIndexStr);
                                     if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                        HBITMAP hImage = clipboard_images[imageIndex];
+                                        HBITMAP hImage = clipboard_images[imageIndex].get();
                                         BITMAP bm;
                                         if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
                                             // IMPORTANTE: Actualizar currentY con la altura real de la imagen
@@ -1436,7 +1800,9 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Usar el grosor del borde configurado por el usuario
         int borderThickness = region_border_thickness.load();
         COLORREF borderColor = region_border_color.load();
-        HPEN hPen = CreatePen(PS_SOLID, borderThickness, borderColor);
+        ScopedPen hPen(CreatePen(PS_SOLID, borderThickness, borderColor));
+        if (!hPen) return; // Verificar que se creó correctamente
+        
         HPEN hOldPen = (HPEN)SelectObject(hMemDC, hPen);
         
         // Función lambda para dibujar rectángulo optimizada
@@ -1477,7 +1843,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         }
         
         SelectObject(hMemDC, hOldPen);
-        DeleteObject(hPen);
+        // hPen se limpia automáticamente al salir del scope
     }
     
     // Mostrar indicador de herramienta activa
@@ -1491,11 +1857,11 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Texto del indicador
         std::wstring toolText;
         switch (current_drawing_tool.load()) {
-            case 1: toolText = L"✏️ LINE"; break;
-            case 2: toolText = L"🏹 ARROW"; break;
-            case 3: toolText = L"🔲 RECTANGLE"; break;
+            case DrawingTool::Line: toolText = L"✏️ LINE"; break;
+            case DrawingTool::Arrow: toolText = L"🏹 ARROW"; break;
+            case DrawingTool::Rectangle: toolText = L"🔲 RECTANGLE"; break;
             // Case 4 (Text) removed
-            case 5: toolText = L"🎨 HIGHLIGHTER"; break;
+            case DrawingTool::Highlighter: toolText = L"🎨 HIGHLIGHTER"; break;
         }
         
         // Fondo del indicador
@@ -1627,7 +1993,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Para otras herramientas, usar min/max para crear rectángulos
         int x1, y1, x2, y2;
         
-        if (current_drawing_tool.load() == 1 || current_drawing_tool.load() == 2) { // Línea o Flecha
+        if (current_drawing_tool.load() == DrawingTool::Line || current_drawing_tool.load() == DrawingTool::Arrow) { // Línea o Flecha
             // Mantener coordenadas originales: inicio fijo, final móvil
             x1 = drawing_start_x.load();
             y1 = drawing_start_y.load();
@@ -1652,17 +2018,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // RECT previewTextRect;
         
         switch (current_drawing_tool.load()) {
-            case 1: // Línea
+            case DrawingTool::Line: // Línea
                 DrawLine(hMemDC, x1, y1, x2, y2, drawing_color.load(), drawing_thickness.load());
                 break;
-            case 2: // Flecha
+            case DrawingTool::Arrow: // Flecha
                 DrawArrow(hMemDC, x1, y1, x2, y2, drawing_color.load(), drawing_thickness.load());
                 break;
-            case 3: // Rectángulo
+            case DrawingTool::Rectangle: // Rectángulo
                 DrawRectangle(hMemDC, x1, y1, x2, y2, drawing_color.load(), drawing_thickness.load(), drawing_fill.load());
                 break;
             // Case 4 (Texto) eliminado
-            case 5: // Resaltador
+            case DrawingTool::Highlighter: // Resaltador
                 DrawHighlighter(hMemDC, x1, y1, x2, y2, drawing_color.load());
                 break;
         }
@@ -1671,17 +2037,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
     // Dibujar todos los elementos de dibujo
     for (const auto& element : drawing_elements) {
         switch (element.tool_type) {
-            case 1: // Línea
+            case DrawingTool::Line: // Línea
                 DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
                 break;
-            case 2: // Flecha
+            case DrawingTool::Arrow: // Flecha
                 DrawArrow(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
                 break;
-            case 3: // Rectángulo
+            case DrawingTool::Rectangle: // Rectángulo
                 DrawRectangle(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness, element.filled);
                 break;
             // Case 4 (Texto) eliminado
-            case 5: // Resaltador
+            case DrawingTool::Highlighter: // Resaltador
                 DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color);
                 break;
         }
@@ -1690,10 +2056,9 @@ void DrawOverlay(HDC hdc, int width, int height) {
     // Copiar el resultado al DC principal (doble buffering)
     BitBlt(hdc, 0, 0, width, height, hMemDC, 0, 0, SRCCOPY);
     
-    // Limpiar recursos
+    // Restaurar bitmap anterior
     SelectObject(hMemDC, hOldBitmap);
-    DeleteObject(hBitmap);
-    DeleteDC(hMemDC);
+    // Los recursos se limpian automáticamente al salir del scope
 }
 
 // Función para dibujar la ventana de configuración moderna
@@ -1708,29 +2073,38 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     int scrollY = scroll_pos.load();
     
     // Crear DC de memoria para doble buffering
-    HDC hMemDC = CreateCompatibleDC(hdc);
-    HBITMAP hBitmap = CreateCompatibleBitmap(hdc, width, height);
+    ScopedDC hMemDC(CreateCompatibleDC(hdc), true);
+    if (!hMemDC) return; // Verificar que se creó correctamente
+    
+    ScopedBitmap hBitmap(CreateCompatibleBitmap(hdc, width, height));
+    if (!hBitmap) return; // Verificar que se creó correctamente
+    
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
     
     // Fondo negro puro (sin transparencia)
-    HBRUSH hBlackBrush = CreateSolidBrush(RGB(0, 0, 0));
+    ScopedBrush hBlackBrush(CreateSolidBrush(RGB(0, 0, 0)), true);
+    if (!hBlackBrush) return; // Verificar que se creó correctamente
+    
     RECT fullRect = {0, 0, width, height};
     FillRect(hMemDC, &fullRect, hBlackBrush);
-    DeleteObject(hBlackBrush);
     
     // Crear fuentes modernas
-    HFONT hTitleFont = CreateFontW(32, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+    ScopedFont hTitleFont(CreateFontW(32, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT hSectionFont = CreateFontW(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI"));
+    if (!hTitleFont) return; // Verificar que se creó correctamente
+    ScopedFont hSectionFont(CreateFontW(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT hSubsectionFont = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI"));
+    if (!hSectionFont) return; // Verificar que se creó correctamente
+    ScopedFont hSubsectionFont(CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT hOptionFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI"));
+    if (!hSubsectionFont) return; // Verificar que se creó correctamente
+    ScopedFont hOptionFont(CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI"));
+    if (!hOptionFont) return; // Verificar que se creó correctamente
     
     HFONT hOldFont = (HFONT)SelectObject(hMemDC, hTitleFont);
     SetBkMode(hMemDC, TRANSPARENT);
@@ -1750,7 +2124,9 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     DrawTextW(hMemDC, L"Screen Highlighter Pro", -1, &subtitleRect, DT_CENTER | DT_TOP);
     
     // Línea separadora moderna
-    HPEN hModernPen = CreatePen(PS_SOLID, 2, RGB(50, 50, 50));
+    ScopedPen hModernPen(CreatePen(PS_SOLID, 2, RGB(50, 50, 50)));
+    if (!hModernPen) return; // Verificar que se creó correctamente
+    
     HPEN hOldPen = (HPEN)SelectObject(hMemDC, hModernPen);
     MoveToEx(hMemDC, 60, headerY + 85, NULL);
     LineTo(hMemDC, width - 60, headerY + 85);
@@ -2083,11 +2459,7 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     // Restaurar objetos
     SelectObject(hMemDC, hOldFont);
     SelectObject(hMemDC, hOldPen);
-    DeleteObject(hTitleFont);
-    DeleteObject(hSectionFont);
-    DeleteObject(hSubsectionFont);
-    DeleteObject(hOptionFont);
-    DeleteObject(hModernPen);
+    // Las fuentes se limpian automáticamente al salir del scope
     
     // Actualizar scroll_max basado en el contenido real - incluir completamente los botones
     scroll_max.store(currentY + 200); // Agregar 200 píxeles de margen para asegurar acceso completo
@@ -2095,36 +2467,42 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     // Copiar el resultado al DC principal
     BitBlt(hdc, 0, 0, width, height, hMemDC, 0, 0, SRCCOPY);
     
-    // Limpiar recursos
+    // Restaurar bitmap anterior
     SelectObject(hMemDC, hOldBitmap);
-    DeleteObject(hBitmap);
-    DeleteDC(hMemDC);
+    // Los recursos se limpian automáticamente al salir del scope
 }
 
 // Función para capturar la región para zoom (captura única optimizada)
 void CaptureZoomRegion(const ScreenRectangle& rect) {
-    // Limpiar bitmap anterior si existe
-    if (hZoomedBitmap) {
-        DeleteObject(hZoomedBitmap);
-        hZoomedBitmap = NULL;
-    }
-    if (hZoomedDC) {
-        DeleteDC(hZoomedDC);
-        hZoomedDC = NULL;
-    }
+    // Limpiar recursos anteriores (las clases RAII se encargan automáticamente)
+    hZoomedBitmap.reset();
+    hZoomedDC.reset();
     
     // Capturar la pantalla de la región
     HDC hScreenDC = GetDC(NULL);
-    hZoomedDC = CreateCompatibleDC(hScreenDC);
+    if (!hScreenDC) return; // Verificar que se obtuvo el DC
+    
+    // Crear nuevo DC de memoria
+    hZoomedDC.reset(CreateCompatibleDC(hScreenDC), true);
+    if (!hZoomedDC) {
+        ReleaseDC(NULL, hScreenDC);
+        return; // Verificar que se creó correctamente
+    }
     
     int width = rect.x2 - rect.x1;
     int height = rect.y2 - rect.y1;
     
-    hZoomedBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
-    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hZoomedDC, hZoomedBitmap);
+    // Crear nuevo bitmap
+    hZoomedBitmap.reset(CreateCompatibleBitmap(hScreenDC, width, height));
+    if (!hZoomedBitmap) {
+        ReleaseDC(NULL, hScreenDC);
+        return; // Verificar que se creó correctamente
+    }
+    
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hZoomedDC.get(), hZoomedBitmap.get());
     
     // Capturar la región original de la pantalla
-    BOOL captureResult = BitBlt(hZoomedDC, 0, 0, width, height, hScreenDC, rect.x1, rect.y1, SRCCOPY);
+    BOOL captureResult = BitBlt(hZoomedDC.get(), 0, 0, width, height, hScreenDC, rect.x1, rect.y1, SRCCOPY);
     if (!captureResult) {
         wchar_t errorMsg[256];
         swprintf_s(errorMsg, L"DEBUG: Captura falló - Error: %d\n", GetLastError());
@@ -2136,7 +2514,7 @@ void CaptureZoomRegion(const ScreenRectangle& rect) {
     }
     
     // Restaurar el bitmap anterior
-    SelectObject(hZoomedDC, hOldBitmap);
+    SelectObject(hZoomedDC.get(), hOldBitmap);
     
     ReleaseDC(NULL, hScreenDC);
     
@@ -2155,14 +2533,10 @@ void CaptureZoomRegion(const ScreenRectangle& rect) {
 
 // Función para limpiar recursos de zoom
 void CleanupZoomResources() {
-    if (hZoomedBitmap) {
-        DeleteObject(hZoomedBitmap);
-        hZoomedBitmap = NULL;
-    }
-    if (hZoomedDC) {
-        DeleteDC(hZoomedDC);
-        hZoomedDC = NULL;
-    }
+    // Limpiar recursos de zoom (las clases RAII se encargan automáticamente)
+    hZoomedBitmap.reset();
+    hZoomedDC.reset();
+    
     zoom_active.store(false);
     zoom_factor.store(1.0f);
     
@@ -2176,27 +2550,18 @@ void CleanupZoomResources() {
     text_selection_start.store(-1);
     text_selection_end.store(-1);
     
-
-    
     // Limpiar marcadores de imagen
     image_markers.clear();
     
-    // Limpiar imágenes del clipboard
-    for (auto& hBitmap : clipboard_images) {
-        if (hBitmap) {
-            DeleteObject(hBitmap);
-        }
-    }
+    // Limpiar imágenes del clipboard (las clases RAII se encargan automáticamente)
     clipboard_images.clear();
     
     // Limpiar elementos de dibujo
     drawing_elements.clear();
     drawing_active.store(false);
-    current_drawing_tool.store(0);
+    current_drawing_tool.store(DrawingTool::None);
     drawing_start_x.store(-1);
     drawing_start_y.store(-1);
-    
-
 }
 
 // Función para crear y mostrar el overlay
@@ -2248,12 +2613,12 @@ void ShowOverlay() {
         while (overlay_active.load()) {
             if (text_input_mode.load()) {
                 text_cursor_visible.store(!text_cursor_visible.load());
-                // Solo redibujar si hay texto visible (no redibujar si está vacío)
-                if (!zoom_text.empty()) {
-                    needsRedraw.store(true);
-                }
+                            // Solo redibujar si hay texto visible (no redibujar si está vacío)
+            if (!zoom_text.empty()) {
+                needsRedraw.store(true);
             }
-            // Usar la velocidad del cursor configurada por el usuario
+        }
+        // Usar la velocidad del cursor configurada por el usuario
             Sleep(text_cursor_blink_speed.load()); // Parpadear según configuración
         }
     });
@@ -2485,7 +2850,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Finalizar dibujo
                 int x1, y1, x2, y2;
                 
-                if (current_drawing_tool.load() == 1 || current_drawing_tool.load() == 2) { // Línea o Flecha
+                if (current_drawing_tool.load() == DrawingTool::Line || current_drawing_tool.load() == DrawingTool::Arrow) { // Línea o Flecha
                     // Para línea y flecha, mantener coordenadas originales sin intercambiar
                     x1 = drawing_start_x.load();
                     y1 = drawing_start_y.load();
@@ -2502,7 +2867,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Verificar tamaño mínimo
                 bool isValidSize = false;
                 
-                if (current_drawing_tool.load() == 1 || current_drawing_tool.load() == 2) { // Línea o Flecha
+                if (current_drawing_tool.load() == DrawingTool::Line || current_drawing_tool.load() == DrawingTool::Arrow) { // Línea o Flecha
                     // Para línea y flecha, verificar distancia mínima entre puntos
                     int distance = (int)sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
                     isValidSize = (distance >= 10); // Distancia mínima de 10 píxeles
@@ -2610,26 +2975,26 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             // Manejar teclas F1-F5 para herramientas de dibujo (siempre disponibles)
             if (wParam == VK_F1) {
                 // F1 - Activar herramienta Línea
-                current_drawing_tool.store(1);
+                current_drawing_tool.store(DrawingTool::Line);
                 drawing_active.store(true);
                 needsRedraw.store(true);
                 return 0;
             } else if (wParam == VK_F2) {
                 // F2 - Activar herramienta Flecha
-                current_drawing_tool.store(2);
+                current_drawing_tool.store(DrawingTool::Arrow);
                 drawing_active.store(true);
                 needsRedraw.store(true);
                 return 0;
             } else if (wParam == VK_F3) {
                 // F3 - Activar herramienta Rectángulo
-                current_drawing_tool.store(3);
+                current_drawing_tool.store(DrawingTool::Rectangle);
                 drawing_active.store(true);
                 needsRedraw.store(true);
                 return 0;
             // F4 (Texto) eliminado
             } else if (wParam == VK_F4) {
                 // F4 - Activar herramienta Resaltador
-                current_drawing_tool.store(5);
+                current_drawing_tool.store(DrawingTool::Highlighter);
                 drawing_active.store(true);
                 needsRedraw.store(true);
                 return 0;
@@ -2645,7 +3010,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 } else if (drawing_active.load()) {
                     // Salir del modo dibujo
                     drawing_active.store(false);
-                    current_drawing_tool.store(0);
+                    current_drawing_tool.store(DrawingTool::None);
                     drawing_start_x.store(-1);
                     drawing_start_y.store(-1);
                     needsRedraw.store(true);
@@ -2682,7 +3047,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Activar modo captura de pantalla
                 screenshot_mode.store(true);
                 drawing_active.store(false);
-                current_drawing_tool.store(0);
+                current_drawing_tool.store(DrawingTool::None);
                 text_input_mode.store(false);
                 needsRedraw.store(true);
                 return 0;
@@ -2695,21 +3060,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Las teclas F1-F5 también funcionan en modo texto para herramientas de dibujo
                 if (wParam == VK_F1) {
                     // F1 - Activar herramienta Línea
-                    current_drawing_tool.store(1);
+                    current_drawing_tool.store(DrawingTool::Line);
                     drawing_active.store(true);
                     text_input_mode.store(false);
                     needsRedraw.store(true);
                     return 0;
                 } else if (wParam == VK_F2) {
                     // F2 - Activar herramienta Flecha
-                    current_drawing_tool.store(2);
+                    current_drawing_tool.store(DrawingTool::Arrow);
                     drawing_active.store(true);
                     text_input_mode.store(false);
                     needsRedraw.store(true);
                     return 0;
                 } else if (wParam == VK_F3) {
                     // F3 - Activar herramienta Rectángulo
-                    current_drawing_tool.store(3);
+                    current_drawing_tool.store(DrawingTool::Rectangle);
                     drawing_active.store(true);
                     text_input_mode.store(false);
                     needsRedraw.store(true);
@@ -2717,7 +3082,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // F4 (Texto) eliminado
                 } else if (wParam == VK_F4) {
                     // F4 - Activar herramienta Resaltador
-                    current_drawing_tool.store(5);
+                    current_drawing_tool.store(DrawingTool::Highlighter);
                     drawing_active.store(true);
                     text_input_mode.store(false);
                     needsRedraw.store(true);
@@ -3877,24 +4242,36 @@ void ResetToDefaultSettings() {
 
 // Función para registrar hotkeys
 bool RegisterHotkeys() {
+    printf("  🔑 Registrando hotkey Shift+Alt+X...\n");
+    
     // Shift+Alt+X
     if (!RegisterHotKey(hMainWnd, 1, MOD_SHIFT | MOD_ALT, 'X')) {
+        printf("  ❌ Error al registrar hotkey Shift+Alt+X\n");
         return false;
     }
     
+    printf("  ✅ Hotkey Shift+Alt+X registrado exitosamente\n");
     return true;
 }
 
 // Función para procesar mensajes de la ventana principal
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
-        case WM_HOTKEY:
+                case WM_HOTKEY:
+            printf("🔥 Hotkey recibido: %d\n", (int)wParam);
             switch (wParam) {
                 case 1: // Shift+Alt+X
+                    printf("🎯 Activando overlay (Shift+Alt+X)\n");
                     if (!overlay_active.load()) {
+                        printf("🚀 Iniciando thread de overlay...\n");
                         std::thread overlay_thread(ShowOverlay);
                         overlay_thread.detach();
+                    } else {
+                        printf("⚠️ Overlay ya está activo\n");
                     }
+                    break;
+                default:
+                    printf("❓ Hotkey desconocido: %d\n", (int)wParam);
                     break;
             }
             break;
@@ -3944,11 +4321,78 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 // Función principal sin ventana de consola
+// Función para verificar si la aplicación tiene permisos de administrador
+bool IsRunningAsAdministrator() {
+    // Método simple y compatible con MinGW
+    HANDLE hToken = NULL;
+    TOKEN_ELEVATION elevation;
+    DWORD size = sizeof(TOKEN_ELEVATION);
+    bool isAdmin = false;
+    
+    // Abrir token del proceso actual
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        // Verificar si el token tiene elevación
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &size)) {
+            isAdmin = (elevation.TokenIsElevated != 0);
+        }
+        CloseHandle(hToken);
+    }
+    
+    return isAdmin;
+}
+
+// Función para solicitar elevación de privilegios
+bool RequestAdminPrivileges() {
+    // Obtener el nombre del ejecutable actual
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    
+    // Crear estructura para ShellExecute
+    SHELLEXECUTEINFOW sei = {0};
+    sei.cbSize = sizeof(SHELLEXECUTEINFOW);
+    sei.lpVerb = L"runas";  // Solicitar ejecución como administrador
+    sei.lpFile = exePath;
+    sei.nShow = SW_NORMAL;
+    
+    // Ejecutar como administrador
+    if (ShellExecuteExW(&sei)) {
+        return true;
+    }
+    
+    return false;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow; // Parámetros no utilizados
+    
+    printf("🚀 Iniciando Screen Highlighter...\n");
+    
+    // Verificar permisos de administrador
+    if (!IsRunningAsAdministrator()) {
+        printf("⚠️ La aplicación requiere permisos de administrador\n");
+        printf("🔐 Solicitando elevación de privilegios...\n");
+        
+        if (RequestAdminPrivileges()) {
+            printf("✅ Permisos de administrador solicitados exitosamente\n");
+            printf("🔄 Cerrando instancia actual...\n");
+            return 0; // Cerrar esta instancia
+        } else {
+            printf("❌ No se pudieron obtener permisos de administrador\n");
+            MessageBoxW(NULL, 
+                L"Screen Highlighter requiere permisos de administrador para funcionar correctamente.\n\n"
+                L"Por favor, ejecuta la aplicación como administrador.",
+                L"Permisos Requeridos", 
+                MB_OK | MB_ICONWARNING);
+            return 1;
+        }
+    }
+    
+    printf("✅ Permisos de administrador verificados\n");
+    
     // Cargar configuración desde archivo .ini al inicio
     LoadConfiguration();
-    
+    printf("✅ Configuración cargada\n");
+                
     // Crear una ventana oculta para manejar mensajes
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
@@ -3958,7 +4402,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hIcon = LoadIconFromFile(TRAY_ICON_LARGE);
     wc.hIconSm = LoadIconFromFile(TRAY_ICON_SMALL);
     
-    RegisterClassExW(&wc);
+                if (!RegisterClassExW(&wc)) {
+        printf("❌ Error al registrar clase principal\n");
+        return 1;
+    }
+    printf("✅ Clase principal registrada\n");
     
     // Registrar clase para el overlay
     WNDCLASSEXW wcOverlay = {};
@@ -3968,7 +4416,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcOverlay.lpszClassName = L"ScreenHighlighterOverlayClass";
     wcOverlay.hCursor = LoadCursor(NULL, IDC_CROSS);
     
-    RegisterClassExW(&wcOverlay);
+    if (!RegisterClassExW(&wcOverlay)) {
+        printf("❌ Error al registrar clase overlay\n");
+        return 1;
+    }
+    printf("✅ Clase overlay registrada\n");
     
     // Registrar clase para la ventana de configuración
     WNDCLASSEXW wcSettings = {};
@@ -3980,7 +4432,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcSettings.hIcon = LoadIconFromFile(TRAY_ICON_SMALL);
     wcSettings.hIconSm = LoadIconFromFile(TRAY_ICON_SMALL);
     
-    RegisterClassExW(&wcSettings);
+    if (!RegisterClassExW(&wcSettings)) {
+        printf("❌ Error al registrar clase settings\n");
+        return 1;
+    }
+    printf("✅ Clase settings registrada\n");
     
     hMainWnd = CreateWindowExW(
         0,
@@ -3992,24 +4448,37 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     );
     
     if (!hMainWnd) {
+        printf("❌ Error al crear ventana principal\n");
         return 1;
     }
+    printf("✅ Ventana principal creada\n");
     
     // Ocultar la ventana
     ShowWindow(hMainWnd, SW_HIDE);
     
     // Agregar icono al system tray
-    AddToSystemTray();
-    
-
+    printf("🔧 Agregando icono al system tray...\n");
+    if (!AddToSystemTray()) {
+        printf("❌ Error al agregar icono al system tray\n");
+        MessageBoxW(NULL, L"Error al agregar icono al system tray", L"Error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    printf("✅ Icono agregado al system tray\n");
     
     // Registrar hotkeys
+    printf("🔧 Registrando hotkeys...\n");
     if (!RegisterHotkeys()) {
+        printf("❌ Error al registrar hotkeys\n");
         MessageBoxW(NULL, L"Error al registrar hotkeys", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+    printf("✅ Hotkeys registrados\n");
     
-    // Bucle principal del mensaje
+        // Bucle principal del mensaje
+    printf("🔄 Iniciando bucle principal de mensajes...\n");
+    printf("💡 Presiona Shift+Alt+X para activar el highlight\n");
+    printf("💡 Busca el icono verde en el system tray\n");
+    
     MSG msg;
     while (running.load() && GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);

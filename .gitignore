@@ -1,82 +1,132 @@
-# Archivos de compilación y ejecutables
-*.exe
-*.obj
-*.o
-*.dll
-*.lib
-*.a
-*.so
-*.dylib
-
-# Archivos de debug y logs
-debug_log.txt
-*.log
-*.tmp
-
-# Screenshots generados por el programa
-*.png
-*.jpg
-*.jpeg
-*.bmp
-*.gif
-
-# Archivos de configuración del usuario
-ScreenHighlighter.ini
-
-# Archivos temporales del sistema
-Thumbs.db
-.DS_Store
-*.swp
-*.swo
-*~
-
-# Archivos de build
+# Build directories
 build/
-Debug/
-Release/
-x64/
-x86/
+build_debug/
+build_debug_silent/
+build_release_console/
+build_advanced/
 
-# Archivos de Visual Studio
-*.vcxproj
-*.vcxproj.filters
-*.vcxproj.user
-*.sln
-*.suo
-*.user
-*.aps
-*.pch
-*.vspscc
-*_i.c
-*_p.c
-*.ilk
-*.meta
-*.obj
-*.pdb
-*.pgc
-*.pgd
-*.rsp
-*.sbr
-*.tlb
-*.tli
-*.tlh
-*.tmp
-*.tmp_proj
-*.log
-*.vspscc
-*.vssscc
-.builds
-*.pidb
-*.svclog
-*.scc
-
-# Archivos de CMake
+# CMake generated files
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+*.cmake
+!CMakeLists.txt
+!config/CMakeConfig.cmake
 
-# Archivos de backup
-*.bak
-*.backup
-*.old
+# Compiled executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+*.tlog
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# nyc test coverage
+.nyc_output
+
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+
+# Screenshots and captures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+# Configuration files (keep template, ignore generated)
+ScreenHighlighter.ini
+!config/ScreenHighlighter.ini.in
+
+# Manifest files
+*.manifest
+
+# Resource files
+*.rc
+*.ico
