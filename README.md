@@ -1,4 +1,4 @@
-# ScreenHighlighter
+# UnnamedHighlighter
 
 A professional screen highlighting and screenshot tool for Windows.
 
