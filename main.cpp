@@ -360,7 +360,8 @@ enum class DrawingTool : uint8_t {
 
 // Enumeración para tipos de mensajes personalizados
 enum class CustomMessage : UINT {
-    Taskbar = WM_USER + 1
+    Taskbar = WM_USER + 1,
+    TaskbarRestored = WM_USER + 2
 };
 
 // ============================================================================
@@ -369,6 +370,7 @@ enum class CustomMessage : UINT {
 
 // Configuración optimizada integrada con constantes de performance
 constexpr UINT WM_TASKBAR = static_cast<UINT>(CustomMessage::Taskbar);
+constexpr UINT WM_TASKBAR_RESTORED = static_cast<UINT>(CustomMessage::TaskbarRestored);
 constexpr int TRAY_ICON_ID = 1;
 constexpr int TRAY_ICON_SMALL = 16;
 constexpr int TRAY_ICON_LARGE = 32;
@@ -471,7 +473,15 @@ std::vector<DrawingElement> drawing_elements;
 // Variables para el system tray
 NOTIFYICONDATA nid;
 HWND hMainWnd;
+bool systemTrayInitialized = false;
 // WM_TASKBAR ya está definido arriba
+
+// Variables para monitoreo de explorer.exe y restauración del system tray
+static DWORD explorerProcessId = 0;
+static HANDLE explorerProcessHandle = NULL;
+static std::thread explorerMonitorThread;
+static std::atomic<bool> explorerMonitorRunning(false);
+static std::atomic<bool> systemTrayRestorationNeeded(false);
 
 // Estructura para almacenar rectángulos
 struct ScreenRectangle {
@@ -732,6 +742,7 @@ bool AddToSystemTray() {
     }
     
     printf("  ✅ Icono agregado exitosamente al system tray\n");
+    systemTrayInitialized = true;
     return true;
 }
 
@@ -746,6 +757,132 @@ void RemoveFromSystemTray() {
     if (nid.hIcon) {
         DestroyIcon(nid.hIcon);
         nid.hIcon = nullptr;
+    }
+}
+
+// Función para restaurar el icono del system tray
+bool RestoreSystemTrayIcon() {
+    printf("🔄 Restaurando icono del system tray...\n");
+    
+    // Verificar si el icono ya está en el system tray
+    if (systemTrayInitialized) {
+        // Intentar restaurar el icono existente
+        if (Shell_NotifyIcon(NIM_MODIFY, &nid)) {
+            printf("✅ Icono del system tray restaurado exitosamente\n");
+            return true;
+        }
+    }
+    
+    // Si no se puede restaurar, agregar uno nuevo
+    printf("🆕 Agregando nuevo icono al system tray...\n");
+    return AddToSystemTray();
+}
+
+// Función para monitorear el proceso explorer.exe
+void MonitorExplorerProcess() {
+    printf("🔍 Iniciando monitoreo de explorer.exe...\n");
+    
+    // Obtener el PID de explorer.exe
+    HWND shellTrayWnd = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (shellTrayWnd) {
+        GetWindowThreadProcessId(shellTrayWnd, &explorerProcessId);
+        printf("📱 Explorer.exe PID: %lu\n", explorerProcessId);
+        
+        if (explorerProcessId > 0) {
+            explorerProcessHandle = OpenProcess(SYNCHRONIZE, FALSE, explorerProcessId);
+            if (explorerProcessHandle) {
+                printf("✅ Monitoreo de explorer.exe iniciado\n");
+                
+                // Monitorear continuamente
+                while (explorerMonitorRunning.load()) {
+                    // Esperar a que explorer.exe termine
+                    DWORD waitResult = WaitForSingleObject(explorerProcessHandle, 1000); // 1 segundo
+                    
+                    if (waitResult == WAIT_OBJECT_0) {
+                        // Explorer.exe terminó
+                        printf("⚠️ Explorer.exe terminó - Restaurando system tray...\n");
+                        systemTrayRestorationNeeded.store(true);
+                        
+                        // Esperar a que explorer.exe se reinicie
+                        Sleep(2000); // 2 segundos
+                        
+                        // Restaurar el icono del system tray
+                        if (RestoreSystemTrayIcon()) {
+                            printf("✅ System tray restaurado después del reinicio de explorer.exe\n");
+                        } else {
+                            printf("❌ Error al restaurar system tray\n");
+                        }
+                        
+                        // Reiniciar el monitoreo
+                        CloseHandle(explorerProcessHandle);
+                        explorerProcessHandle = NULL;
+                        
+                        // Buscar el nuevo proceso de explorer.exe
+                        Sleep(1000); // 1 segundo
+                        shellTrayWnd = FindWindowW(L"Shell_TrayWnd", NULL);
+                        if (shellTrayWnd) {
+                            GetWindowThreadProcessId(shellTrayWnd, &explorerProcessId);
+                            if (explorerProcessId > 0) {
+                                explorerProcessHandle = OpenProcess(SYNCHRONIZE, FALSE, explorerProcessId);
+                                if (explorerProcessHandle) {
+                                    printf("✅ Monitoreo de explorer.exe reiniciado\n");
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Verificar si el icono del system tray sigue visible
+                    if (!systemTrayRestorationNeeded.load()) {
+                        // Verificar si el icono está visible
+                        if (systemTrayInitialized) {
+                            // Enviar mensaje de prueba al system tray
+                            if (!Shell_NotifyIcon(NIM_MODIFY, &nid)) {
+                                printf("⚠️ Icono del system tray no responde - Restaurando...\n");
+                                if (RestoreSystemTrayIcon()) {
+                                    printf("✅ System tray restaurado\n");
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (explorerProcessHandle) {
+                    CloseHandle(explorerProcessHandle);
+                    explorerProcessHandle = NULL;
+                }
+            }
+        }
+    }
+    
+    printf("🔍 Monitoreo de explorer.exe terminado\n");
+}
+
+// Función para iniciar el monitoreo de explorer.exe
+void StartExplorerMonitoring() {
+    if (!explorerMonitorRunning.load()) {
+        printf("🚀 Iniciando monitoreo de explorer.exe...\n");
+        explorerMonitorRunning.store(true);
+        explorerMonitorThread = std::thread(MonitorExplorerProcess);
+        printf("✅ Monitoreo de explorer.exe iniciado\n");
+    }
+}
+
+// Función para detener el monitoreo de explorer.exe
+void StopExplorerMonitoring() {
+    if (explorerMonitorRunning.load()) {
+        printf("🛑 Deteniendo monitoreo de explorer.exe...\n");
+        explorerMonitorRunning.store(false);
+        
+        if (explorerMonitorThread.joinable()) {
+            explorerMonitorThread.join();
+        }
+        
+        if (explorerProcessHandle) {
+            CloseHandle(explorerProcessHandle);
+            explorerProcessHandle = NULL;
+        }
+        
+        printf("✅ Monitoreo de explorer.exe detenido\n");
     }
 }
 
@@ -4310,6 +4447,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             break;
             
+        case WM_TIMER:
+            if (wParam == 1) { // Timer de verificación del system tray
+                printf("⏰ Verificando estado del system tray...\n");
+                
+                // Verificar si el icono del system tray está visible
+                if (systemTrayInitialized) {
+                    // Enviar mensaje de prueba al system tray
+                    if (!Shell_NotifyIcon(NIM_MODIFY, &nid)) {
+                        printf("⚠️ Icono del system tray no responde - Restaurando...\n");
+                        if (RestoreSystemTrayIcon()) {
+                            printf("✅ System tray restaurado por timer\n");
+                        } else {
+                            printf("❌ Error al restaurar system tray por timer\n");
+                        }
+                    } else {
+                        printf("✅ System tray responde correctamente\n");
+                    }
+                }
+            }
+            break;
+            
         case WM_DESTROY:
             PostQuitMessage(0);
             break;
@@ -4474,7 +4632,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     printf("✅ Hotkeys registrados\n");
     
-        // Bucle principal del mensaje
+    // Iniciar monitoreo de explorer.exe para restauración automática del system tray
+    printf("🔍 Iniciando monitoreo de explorer.exe...\n");
+    StartExplorerMonitoring();
+    printf("✅ Monitoreo de explorer.exe iniciado\n");
+    
+    // Configurar timer para verificar periódicamente el system tray
+    SetTimer(hMainWnd, 1, 30000, NULL); // Verificar cada 30 segundos
+    printf("⏰ Timer de verificación del system tray configurado\n");
+    
+    // Bucle principal del mensaje
     printf("🔄 Iniciando bucle principal de mensajes...\n");
     printf("💡 Presiona Shift+Alt+X para activar el highlight\n");
     printf("💡 Busca el icono verde en el system tray\n");
@@ -4487,6 +4654,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Limpiar hotkeys
     UnregisterHotKey(hMainWnd, 1);
+    
+    // Limpiar timer
+    KillTimer(hMainWnd, 1);
+    
+    // Detener monitoreo de explorer.exe
+    printf("🛑 Deteniendo monitoreo de explorer.exe...\n");
+    StopExplorerMonitoring();
     
     // Remover del system tray
     RemoveFromSystemTray();

@@ -11,6 +11,7 @@
 - ✅ **Annotation tools** (line, arrow, rectangle, highlighter)
 - ✅ **Global hotkey system** (Shift+Alt+X)
 - ✅ **System tray integration** with custom icon
+- ✅ **System tray auto-restoration** when explorer.exe restarts
 - ✅ **Persistent configuration** with .ini file
 - ✅ **Zoom and capture** of specific regions
 - ✅ **Undo/Redo** of drawing elements
@@ -22,6 +23,8 @@
 - ✅ **Robust error handling** with explicit validations
 - ✅ **Professional CMake build system** and flexible
 - ✅ **Multiple compilation modes** for different needs
+- ✅ **System tray reliability system** with automatic restoration
+- ✅ **Explorer.exe process monitoring** for seamless recovery
 
 ## 🚀 **Quick Compilation (Recommended)**
 
@@ -100,6 +103,12 @@ build_advanced.bat
 - **MinGW-w64** or **Visual Studio 2019+** - C++ compiler
 - **C++17** compatible compiler
 
+### **Advanced Features**
+- **🔐 Automatic Administrator Privileges**: UAC prompt and automatic elevation
+- **🔄 System Tray Auto-Restoration**: Automatically restores icon when explorer.exe restarts
+- **⏰ Periodic Health Checks**: Monitors system tray status every 30 seconds
+- **🔍 Explorer.exe Monitoring**: Detects when Windows shell restarts and restores functionality
+
 ### **Main Hotkeys**
 - **Shift + Alt + X** - Activate selection mode
 - **F1** - Line tool
@@ -131,12 +140,20 @@ build_advanced.bat
 - **`DrawingTool`** - Drawing tools
 - **`CustomMessage`** - Custom Windows messages
 
+### **System Tray Auto-Restoration**
+- **🔄 Explorer.exe Monitoring**: Continuous monitoring of Windows shell process
+- **⏰ Periodic Health Checks**: 30-second timer for system tray verification
+- **🆕 Automatic Recovery**: Restores icon when system tray becomes unresponsive
+- **🔄 Seamless Restoration**: No user intervention required
+- **📱 Process Lifecycle Management**: Handles explorer.exe restarts gracefully
+
 ### **Improvement Benefits**
 - ✅ **No Memory Leaks**: Automatic GDI resource management
 - ✅ **Robust Code**: Validity checks in all operations
 - ✅ **Maintainable**: Clear and predictable structure
 - ✅ **Performance**: Efficient resource management
 - ✅ **Debugging**: Predictable behavior and easy debugging
+- ✅ **System Tray Reliability**: Automatic restoration after explorer.exe restarts
 
 ## 📁 **Project Structure**
 
