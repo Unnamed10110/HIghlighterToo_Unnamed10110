@@ -38,15 +38,15 @@ A professional screen highlighting and screenshot tool for Windows.
 
 ### **1. Compile:**
 ```bash
-build.bat
+.\build.bat
 ```
 
-### **2. Install (Auto-elevation):**
+### **2. Run:**
 ```bash
-install_admin.bat
+.\ScreenHighlighter.exe
 ```
 
-### **3. Ready!** Runs automatically on startup
+### **3. Ready!** The program is completely standalone and portable
 
 ## 🎯 **Quick Usage**
 
@@ -79,12 +79,21 @@ install_admin.bat
 - **Select All**: `Ctrl+A` to select entire text
 - **Visual Feedback**: Selected text highlighted in blue with white text
 
-## 🔧 **System Files**
+## 🔧 **Project Files**
 
-- **`ScreenHighlighter.exe`** - Main program
-- **`ScreenHighlighter.ini`** - Configuration
-- **`misc01.ico`** - Custom icon
-- **`ScreenHighlighter.manifest`** - Administrator permissions
+### **Core Files:**
+- **`main.cpp`** - Source code (C++17)
+- **`build.bat`** - Build script with strict warnings enabled
+- **`ScreenHighlighter.exe`** - Compiled executable (standalone)
+
+### **Configuration & Resources:**
+- **`ScreenHighlighter.ini`** - User configuration
+- **`misc01.ico`** - Application icon
+- **`ScreenHighlighter.manifest`** - Administrator permissions manifest
+
+### **Development:**
+- **`.gitignore`** - Git ignore patterns for build artifacts
+- **`README.md`** - Project documentation
 
 ## 📁 **Screenshot Location**
 
@@ -93,7 +102,7 @@ Screenshots are saved in the executable directory with format:
 22_08_2025-15-30-45.png
 ```
 
-## 🚀 **Portability**
+## 🚀 **Portability & Development**
 
 **ScreenHighlighter is a completely standalone executable:**
 - ✅ **No installation required**: Can run directly from any folder
@@ -102,11 +111,15 @@ Screenshots are saved in the executable directory with format:
 - ✅ **USB portable**: Can be carried on USB drives
 - ✅ **Network deployment**: Easy to deploy across multiple computers
 
+**Development-friendly:**
+- ✅ **Source code included**: Full C++17 implementation
+- ✅ **Build automation**: `build.bat` with strict compiler warnings
+- ✅ **Version control ready**: `.gitignore` configured for build artifacts
+- ✅ **Clean project structure**: Organized file layout
+
 ## 🗑️ **Uninstallation**
 
-```bash
-uninstall.bat
-```
+Simply delete the `ScreenHighlighter.exe` file. No system files are modified, making it completely safe to remove.
 
 ## ⚡ **Keyboard Shortcuts**
 
@@ -127,8 +140,7 @@ uninstall.bat
 
 ## 🎨 **Technical Features**
 
-- ✅ **Automatic permissions**: Automatic UAC
-- ✅ **Auto-start**: Runs on Windows startup
+- ✅ **Automatic permissions**: Automatic UAC elevation when needed
 - ✅ **Custom icon**: Integrated in executable
 - ✅ **Clean captures**: No selection borders
 - ✅ **Correct orientation**: No image flipping
@@ -137,6 +149,8 @@ uninstall.bat
 - ✅ **Standalone executable**: No external dependencies required
 - ✅ **Portable**: Can be moved to any Windows system
 - ✅ **Self-contained**: All libraries included in the executable
+- ✅ **Source code included**: Full C++17 source code available
+- ✅ **Build system**: Automated build script with strict warnings
 
 ## 🚀 **Performance Optimizations**
 
@@ -147,6 +161,31 @@ uninstall.bat
 - ✅ **Memory management**: Pre-reserved memory for strings
 - ✅ **Efficient algorithms**: Optimized text processing and image handling
 - ✅ **Resource optimization**: Reduced GDI resource usage
+
+## 🔨 **Development & Building**
+
+### **Requirements:**
+- **Compiler**: MinGW-w64 or MSYS2 with g++ support
+- **C++ Standard**: C++17 or higher
+- **OS**: Windows 10/11
+
+### **Build Process:**
+```bash
+# Compile with strict warnings enabled
+.\build.bat
+
+# The script will:
+# - Check for g++ availability
+# - Compile with -Wall -Wextra -Wpedantic -Werror
+# - Create standalone executable
+# - Show compilation status
+```
+
+### **Build Features:**
+- **Strict warnings**: All warnings treated as errors
+- **Optimization**: Maximum performance optimization flags
+- **Static linking**: No external dependencies
+- **Standalone**: Single executable file output
 
 ---
 
@@ -176,6 +215,13 @@ This program was inspired by **xshare** but designed to work in **real-time** fo
 - ⚡ **Resource Caching**: Font objects cached for better performance
 - ⚡ **Memory Efficiency**: Optimized string handling and memory management
 - ⚡ **Algorithm Optimization**: Faster text processing and image handling
+
+### **Development & Build System:**
+- 🔧 **Build Automation**: `build.bat` with strict compiler warnings
+- 🔧 **Code Quality**: All warnings treated as errors (-Werror)
+- 🔧 **Project Structure**: Clean organization with `.gitignore`
+- 🔧 **Source Code**: Full C++17 implementation included
+- 🔧 **Bug Documentation**: Known issues documented with workarounds
 
 ---
 
