@@ -12,6 +12,8 @@
 - ✅ **Global hotkey system** (Shift+Alt+X)
 - ✅ **System tray integration** with custom icon
 - ✅ **System tray auto-restoration** when explorer.exe restarts
+- ✅ **Auto-start on Windows login** with registry management
+- ✅ **Professional executable icon** with Windows resource compilation
 - ✅ **Persistent configuration** with .ini file
 - ✅ **Zoom and capture** of specific regions
 - ✅ **Undo/Redo** of drawing elements
@@ -25,6 +27,8 @@
 - ✅ **Multiple compilation modes** for different needs
 - ✅ **System tray reliability system** with automatic restoration
 - ✅ **Explorer.exe process monitoring** for seamless recovery
+- ✅ **Professional executable icon** with Windows resource compilation
+- ✅ **Version information** embedded in executable properties
 
 ## 🚀 **Quick Compilation (Recommended)**
 
@@ -108,6 +112,8 @@ build_advanced.bat
 - **🔄 System Tray Auto-Restoration**: Automatically restores icon when explorer.exe restarts
 - **⏰ Periodic Health Checks**: Monitors system tray status every 30 seconds
 - **🔍 Explorer.exe Monitoring**: Detects when Windows shell restarts and restores functionality
+- **🚀 Auto-Start on Login**: Option to automatically launch when Windows starts
+- **⚙️ Registry Management**: Automatic Windows registry configuration for startup
 
 ### **Main Hotkeys**
 - **Shift + Alt + X** - Activate selection mode
@@ -146,6 +152,8 @@ build_advanced.bat
 - **🆕 Automatic Recovery**: Restores icon when system tray becomes unresponsive
 - **🔄 Seamless Restoration**: No user intervention required
 - **📱 Process Lifecycle Management**: Handles explorer.exe restarts gracefully
+- **🚀 Auto-Start Management**: Registry-based startup configuration
+- **⚙️ User Control**: Enable/disable auto-start from system tray menu
 
 ### **Improvement Benefits**
 - ✅ **No Memory Leaks**: Automatic GDI resource management
@@ -154,6 +162,8 @@ build_advanced.bat
 - ✅ **Performance**: Efficient resource management
 - ✅ **Debugging**: Predictable behavior and easy debugging
 - ✅ **System Tray Reliability**: Automatic restoration after explorer.exe restarts
+- ✅ **Auto-Start Convenience**: Application launches automatically on Windows startup
+- ✅ **User Control**: Easy enable/disable of auto-start functionality
 
 ## 📁 **Project Structure**
 
@@ -166,6 +176,7 @@ ScreenHighlighter/
 ├── config/                    # Project configuration
 │   ├── CMakeConfig.cmake      # Default values
 │   └── ScreenHighlighter.ini.in # Configuration template
+├── resources.rc               # Windows resource file (icon + version info)
 ├── README.md                  # This file (unified documentation)
 ├── .gitignore                 # Optimized Git ignore
 └── misc01.ico                 # Application icon
@@ -223,6 +234,47 @@ Screen Highlighter requires administrator privileges for the following reasons:
 - **First Run**: Windows will show UAC dialog asking for permission
 - **Subsequent Runs**: May remember the choice depending on Windows settings
 - **No Manual Steps**: Users don't need to manually "Run as Administrator"
+
+## 🚀 **Auto-Start on Windows Login**
+
+### **How It Works**
+- **Registry Configuration**: Automatically configures Windows registry for startup
+- **User Control**: Right-click system tray icon to enable/disable auto-start
+- **Persistent Settings**: Configuration survives Windows updates and restarts
+- **Admin Rights**: Requires administrator privileges (automatically requested)
+
+### **User Controls**
+- **Enable Auto-Start**: Right-click system tray → "✅ Habilitar Auto-Inicio"
+- **Disable Auto-Start**: Right-click system tray → "🚫 Deshabilitar Auto-Inicio"
+- **Status Display**: Application shows auto-start status on startup
+
+### **Registry Location**
+```
+HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+Value Name: "Screen Highlighter"
+Value Data: [Full path to ScreenHighlighter.exe]
+```
+
+## 🎨 **Executable Icon and Resources**
+
+### **Professional Appearance**
+- **🎯 Custom Icon**: `misc01.ico` embedded in executable
+- **📱 Windows Integration**: Icon appears in taskbar, file explorer, and system tray
+- **🔧 Resource Compilation**: Windows resource file (`resources.rc`) for professional look
+- **📋 Version Information**: File properties show company, description, and version
+
+### **Resource File Contents**
+- **Icon**: `misc01.ico` (16x16, 32x32, 48x48, 256x256 pixels)
+- **Company**: Unnamed10110
+- **Description**: Screen Highlighter - Screen Capture and Annotation Tool
+- **Version**: 1.0.0.0
+- **Copyright**: Copyright (C) 2025 Unnamed10110
+
+### **Build Integration**
+- **CMake**: Automatically includes `resources.rc` in compilation
+- **Windows**: Generates native Windows resource object files
+- **Linking**: Resources embedded directly in executable
+- **Size**: Executable includes icon and version information
 
 ### **Advanced Configuration**
 ```bash

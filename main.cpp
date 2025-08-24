@@ -377,8 +377,10 @@ constexpr int TRAY_ICON_LARGE = 32;
 constexpr char TRAY_TOOLTIP_TEXT[] = "Screen Highlighter";
 constexpr int MENU_ACTIVATE_ID = 1001;
 constexpr int MENU_SETTINGS_ID = 1002;
-constexpr int MENU_EXIT_ID = 1003;
-constexpr int MENU_SEPARATOR_ID = 1003;
+constexpr int MENU_ENABLE_AUTOSTART_ID = 1003;
+constexpr int MENU_DISABLE_AUTOSTART_ID = 1004;
+constexpr int MENU_EXIT_ID = 1005;
+constexpr int MENU_SEPARATOR_ID = 1006;
 constexpr wchar_t MENU_ACTIVATE_TEXT[] = L"Activate Highlight (Shift+Alt+X)";
 constexpr wchar_t MENU_EXIT_TEXT[] = L"Exit";
 constexpr wchar_t MENU_SEPARATOR_TEXT[] = L"";
@@ -886,6 +888,95 @@ void StopExplorerMonitoring() {
     }
 }
 
+// Función para verificar si la aplicación está configurada para auto-ejecutarse
+bool IsAutoStartEnabled() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
+        0, KEY_READ, &hKey);
+    
+    if (result != ERROR_SUCCESS) {
+        return false;
+    }
+    
+    wchar_t valueName[256];
+    DWORD valueNameSize = sizeof(valueName);
+    DWORD index = 0;
+    
+    // Buscar si ya existe una entrada para Screen Highlighter
+    while (RegEnumValueW(hKey, index, valueName, &valueNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+        if (wcsstr(valueName, L"Screen Highlighter") != NULL) {
+            RegCloseKey(hKey);
+            return true;
+        }
+        valueNameSize = sizeof(valueName);
+        index++;
+    }
+    
+    RegCloseKey(hKey);
+    return false;
+}
+
+// Función para habilitar la auto-ejecución al iniciar sesión
+bool EnableAutoStart() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
+        0, KEY_WRITE, &hKey);
+    
+    if (result != ERROR_SUCCESS) {
+        printf("❌ Error al abrir clave del registro para auto-ejecución\n");
+        return false;
+    }
+    
+    // Obtener la ruta completa del ejecutable
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    
+    // Crear la entrada en el registro
+    result = RegSetValueExW(hKey, L"Screen Highlighter", 0, REG_SZ, 
+        (const BYTE*)exePath, (wcslen(exePath) + 1) * sizeof(wchar_t));
+    
+    RegCloseKey(hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        printf("✅ Auto-ejecución habilitada exitosamente\n");
+        return true;
+    } else {
+        printf("❌ Error al configurar auto-ejecución\n");
+        return false;
+    }
+}
+
+// Función para deshabilitar la auto-ejecución al iniciar sesión
+bool DisableAutoStart() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
+        0, KEY_WRITE, &hKey);
+    
+    if (result != ERROR_SUCCESS) {
+        printf("❌ Error al abrir clave del registro para auto-ejecución\n");
+        return false;
+    }
+    
+    // Eliminar la entrada del registro
+    result = RegDeleteValueW(hKey, L"Screen Highlighter");
+    
+    RegCloseKey(hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        printf("✅ Auto-ejecución deshabilitada exitosamente\n");
+        return true;
+    } else if (result == ERROR_FILE_NOT_FOUND) {
+        printf("ℹ️ Auto-ejecución ya estaba deshabilitada\n");
+        return true;
+    } else {
+        printf("❌ Error al deshabilitar auto-ejecución\n");
+        return false;
+    }
+}
+
 // Función para mostrar el menú contextual del system tray
 void ShowTrayMenu() {
     POINT pt;
@@ -893,7 +984,16 @@ void ShowTrayMenu() {
     
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING, MENU_ACTIVATE_ID, MENU_ACTIVATE_TEXT);
-            AppendMenuW(hMenu, MF_STRING, MENU_SETTINGS_ID, L"⚙️ Settings");
+    AppendMenuW(hMenu, MF_STRING, MENU_SETTINGS_ID, L"⚙️ Settings");
+    
+    // Agregar opciones de auto-ejecución
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    if (IsAutoStartEnabled()) {
+        AppendMenuW(hMenu, MF_STRING, MENU_DISABLE_AUTOSTART_ID, L"🚫 Deshabilitar Auto-Inicio");
+    } else {
+        AppendMenuW(hMenu, MF_STRING, MENU_ENABLE_AUTOSTART_ID, L"✅ Habilitar Auto-Inicio");
+    }
+    
     AppendMenuW(hMenu, MF_SEPARATOR, MENU_SEPARATOR_ID, MENU_SEPARATOR_TEXT);
     AppendMenuW(hMenu, MF_STRING, MENU_EXIT_ID, MENU_EXIT_TEXT);
     
@@ -4440,6 +4540,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     ShowSettingsOverlay();
                     break;
                     
+                case MENU_ENABLE_AUTOSTART_ID: // Habilitar Auto-Inicio
+                    printf("🚀 Habilitando auto-ejecución al iniciar sesión...\n");
+                    if (EnableAutoStart()) {
+                        MessageBoxW(hMainWnd, 
+                            L"Auto-ejecución habilitada exitosamente.\n\n"
+                            L"La aplicación se ejecutará automáticamente cada vez que inicies sesión en Windows.",
+                            L"Auto-Inicio Habilitado", 
+                            MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        MessageBoxW(hMainWnd, 
+                            L"Error al habilitar auto-ejecución.\n\n"
+                            L"Verifica que tengas permisos de administrador.",
+                            L"Error", 
+                            MB_OK | MB_ICONERROR);
+                    }
+                    break;
+                    
+                case MENU_DISABLE_AUTOSTART_ID: // Deshabilitar Auto-Inicio
+                    printf("🚫 Deshabilitando auto-ejecución al iniciar sesión...\n");
+                    if (DisableAutoStart()) {
+                        MessageBoxW(hMainWnd, 
+                            L"Auto-ejecución deshabilitada exitosamente.\n\n"
+                            L"La aplicación ya no se ejecutará automáticamente al iniciar sesión.",
+                            L"Auto-Inicio Deshabilitado", 
+                            MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        MessageBoxW(hMainWnd, 
+                            L"Error al deshabilitar auto-ejecución.",
+                            L"Error", 
+                            MB_OK | MB_ICONERROR);
+                    }
+                    break;
+                    
                 case MENU_EXIT_ID: // Salir
                     running.store(false);
                     PostQuitMessage(0);
@@ -4631,6 +4764,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
     printf("✅ Hotkeys registrados\n");
+    
+    // Verificar estado de auto-ejecución
+    if (IsAutoStartEnabled()) {
+        printf("🚀 Auto-ejecución al iniciar sesión: HABILITADA\n");
+    } else {
+        printf("🚫 Auto-ejecución al iniciar sesión: DESHABILITADA\n");
+    }
     
     // Iniciar monitoreo de explorer.exe para restauración automática del system tray
     printf("🔍 Iniciando monitoreo de explorer.exe...\n");

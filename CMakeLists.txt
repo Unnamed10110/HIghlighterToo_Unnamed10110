@@ -63,8 +63,15 @@ set(HEADERS
     # Agregar aquí archivos de cabecera si los hay
 )
 
+# Archivos de recursos (solo para Windows)
+if(WIN32)
+    set(RESOURCES
+        resources.rc
+    )
+endif()
+
 # Crear ejecutable principal
-add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
+add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${RESOURCES})
 
 # Configurar propiedades del ejecutable
 set_target_properties(${PROJECT_NAME} PROPERTIES
