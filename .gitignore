@@ -1,0 +1,82 @@
+# Archivos de compilación y ejecutables
+*.exe
+*.obj
+*.o
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+
+# Archivos de debug y logs
+debug_log.txt
+*.log
+*.tmp
+
+# Screenshots generados por el programa
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+
+# Archivos de configuración del usuario
+ScreenHighlighter.ini
+
+# Archivos temporales del sistema
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Archivos de build
+build/
+Debug/
+Release/
+x64/
+x86/
+
+# Archivos de Visual Studio
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.ilk
+*.meta
+*.obj
+*.pdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*.log
+*.vspscc
+*.vssscc
+.builds
+*.pidb
+*.svclog
+*.scc
+
+# Archivos de CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Archivos de backup
+*.bak
+*.backup
+*.old
