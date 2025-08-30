@@ -98,7 +98,14 @@ build_advanced.bat
 - **Use**: ⚠️ **Not recommended until issues resolved**
 
 ## 🎮 **Application Usage**
+- Example:
 
+
+https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
+
+
+
+  
 ### **System Requirements**
 - **Windows 10/11** (x64) - Primary target
 - **Windows 8.1/8/7** - Supported with limitations
@@ -121,7 +128,7 @@ build_advanced.bat
 - **F2** - Arrow tool
 - **F3** - Rectangle tool
 - **F4** - Highlighter tool
-- **Shift + Alt + X** (overlay activo) - Screen capture mode
+- **Ctrl + Enter** - Screen capture mode
 - **Ctrl + Z** - Undo last element
 - **ESC** - Exit current mode
 
@@ -129,9 +136,8 @@ build_advanced.bat
 1. **Activate**: Press `Shift+Alt+X` or double-click the system tray icon
 2. **Select**: Draw a region on the screen
 3. **Annotate**: Use F1-F4 tools to draw
-4. **Capture**: Press `Shift+Alt+X` again when overlay is active to enter screenshot mode
-5. **Configure**: Right-click on the icon → Settings
-6. **Exit**: Right-click on the icon → Exit
+4. **Configure**: Right-click on the icon → Settings
+5. **Exit**: Right-click on the icon → Exit
 
 ## 🏗️ **Code Architecture**
 
