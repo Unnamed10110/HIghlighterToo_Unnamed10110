@@ -121,7 +121,7 @@ build_advanced.bat
 - **F2** - Arrow tool
 - **F3** - Rectangle tool
 - **F4** - Highlighter tool
-- **Ctrl + Enter** - Screen capture mode
+- **Shift + Alt + X** (overlay activo) - Screen capture mode
 - **Ctrl + Z** - Undo last element
 - **ESC** - Exit current mode
 
@@ -129,8 +129,9 @@ build_advanced.bat
 1. **Activate**: Press `Shift+Alt+X` or double-click the system tray icon
 2. **Select**: Draw a region on the screen
 3. **Annotate**: Use F1-F4 tools to draw
-4. **Configure**: Right-click on the icon → Settings
-5. **Exit**: Right-click on the icon → Exit
+4. **Capture**: Press `Shift+Alt+X` again when overlay is active to enter screenshot mode
+5. **Configure**: Right-click on the icon → Settings
+6. **Exit**: Right-click on the icon → Exit
 
 ## 🏗️ **Code Architecture**
 

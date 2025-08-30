@@ -888,6 +888,10 @@ void StopExplorerMonitoring() {
     }
 }
 
+// Declaraciones adelantadas
+bool IsRunningAsAdministrator();
+void ShowAutoStartStatus();
+
 // Función para verificar si la aplicación está configurada para auto-ejecutarse
 bool IsAutoStartEnabled() {
     HKEY hKey;
@@ -896,42 +900,69 @@ bool IsAutoStartEnabled() {
         0, KEY_READ, &hKey);
     
     if (result != ERROR_SUCCESS) {
+        printf("❌ Error al abrir clave del registro para verificar auto-ejecución: %ld\n", result);
         return false;
     }
     
-    wchar_t valueName[256];
-    DWORD valueNameSize = sizeof(valueName);
-    DWORD index = 0;
+    wchar_t valueData[MAX_PATH];
+    DWORD dataSize = sizeof(valueData);
+    DWORD dataType = REG_SZ;
     
-    // Buscar si ya existe una entrada para Screen Highlighter
-    while (RegEnumValueW(hKey, index, valueName, &valueNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-        if (wcsstr(valueName, L"Screen Highlighter") != NULL) {
-            RegCloseKey(hKey);
-            return true;
-        }
-        valueNameSize = sizeof(valueName);
-        index++;
-    }
+    // Verificar si existe el valor "Screen Highlighter"
+    result = RegQueryValueExW(hKey, L"Screen Highlighter", NULL, &dataType, 
+                             (LPBYTE)valueData, &dataSize);
     
     RegCloseKey(hKey);
-    return false;
+    
+    if (result == ERROR_SUCCESS) {
+        printf("✅ Valor de auto-ejecución encontrado: %ls\n", valueData);
+        return true;
+    } else if (result == ERROR_FILE_NOT_FOUND) {
+        printf("ℹ️ Valor de auto-ejecución no encontrado\n");
+        return false;
+    } else {
+        printf("❌ Error al leer valor de auto-ejecución: %ld\n", result);
+        return false;
+    }
 }
 
 // Función para habilitar la auto-ejecución al iniciar sesión
 bool EnableAutoStart() {
+    printf("🔧 Intentando habilitar auto-ejecución...\n");
+    
+    // Verificar permisos de administrador
+    if (!IsRunningAsAdministrator()) {
+        printf("❌ Se requieren permisos de administrador para configurar auto-inicio\n");
+        return false;
+    }
+    
     HKEY hKey;
     LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
         0, KEY_WRITE, &hKey);
     
     if (result != ERROR_SUCCESS) {
-        printf("❌ Error al abrir clave del registro para auto-ejecución\n");
+        printf("❌ Error al abrir clave del registro para auto-ejecución: %ld\n", result);
         return false;
     }
     
     // Obtener la ruta completa del ejecutable
     wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
+        printf("❌ Error al obtener ruta del ejecutable: %ld\n", GetLastError());
+        RegCloseKey(hKey);
+        return false;
+    }
+    
+    printf("📁 Ruta del ejecutable: %ls\n", exePath);
+    
+    // Verificar que el archivo existe
+    DWORD fileAttributes = GetFileAttributesW(exePath);
+    if (fileAttributes == INVALID_FILE_ATTRIBUTES) {
+        printf("❌ El archivo ejecutable no existe o no es accesible: %ld\n", GetLastError());
+        RegCloseKey(hKey);
+        return false;
+    }
     
     // Crear la entrada en el registro
     result = RegSetValueExW(hKey, L"Screen Highlighter", 0, REG_SZ, 
@@ -940,23 +971,39 @@ bool EnableAutoStart() {
     RegCloseKey(hKey);
     
     if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-ejecución habilitada exitosamente\n");
-        return true;
+        printf("✅ Auto-ejecución habilitada exitosamente en el registro\n");
+        
+        // Verificar que se escribió correctamente
+        if (IsAutoStartEnabled()) {
+            printf("✅ Verificación exitosa: auto-ejecución está habilitada\n");
+            return true;
+        } else {
+            printf("⚠️ Auto-ejecución se escribió pero no se puede verificar\n");
+            return false;
+        }
     } else {
-        printf("❌ Error al configurar auto-ejecución\n");
+        printf("❌ Error al configurar auto-ejecución en el registro: %ld\n", result);
         return false;
     }
 }
 
 // Función para deshabilitar la auto-ejecución al iniciar sesión
 bool DisableAutoStart() {
+    printf("🔧 Intentando deshabilitar auto-ejecución...\n");
+    
+    // Verificar permisos de administrador
+    if (!IsRunningAsAdministrator()) {
+        printf("❌ Se requieren permisos de administrador para configurar auto-inicio\n");
+        return false;
+    }
+    
     HKEY hKey;
     LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
         0, KEY_WRITE, &hKey);
     
     if (result != ERROR_SUCCESS) {
-        printf("❌ Error al abrir clave del registro para auto-ejecución\n");
+        printf("❌ Error al abrir clave del registro para auto-ejecución: %ld\n", result);
         return false;
     }
     
@@ -966,13 +1013,21 @@ bool DisableAutoStart() {
     RegCloseKey(hKey);
     
     if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-ejecución deshabilitada exitosamente\n");
-        return true;
+        printf("✅ Auto-ejecución deshabilitada exitosamente del registro\n");
+        
+        // Verificar que se eliminó correctamente
+        if (!IsAutoStartEnabled()) {
+            printf("✅ Verificación exitosa: auto-ejecución está deshabilitada\n");
+            return true;
+        } else {
+            printf("⚠️ Auto-ejecución se eliminó pero no se puede verificar\n");
+            return false;
+        }
     } else if (result == ERROR_FILE_NOT_FOUND) {
         printf("ℹ️ Auto-ejecución ya estaba deshabilitada\n");
         return true;
     } else {
-        printf("❌ Error al deshabilitar auto-ejecución\n");
+        printf("❌ Error al deshabilitar auto-ejecución del registro: %ld\n", result);
         return false;
     }
 }
@@ -993,6 +1048,9 @@ void ShowTrayMenu() {
     } else {
         AppendMenuW(hMenu, MF_STRING, MENU_ENABLE_AUTOSTART_ID, L"✅ Habilitar Auto-Inicio");
     }
+    
+    // Agregar opción para mostrar estado detallado
+    AppendMenuW(hMenu, MF_STRING, 1007, L"🔍 Estado del Auto-Inicio");
     
     AppendMenuW(hMenu, MF_SEPARATOR, MENU_SEPARATOR_ID, MENU_SEPARATOR_TEXT);
     AppendMenuW(hMenu, MF_STRING, MENU_EXIT_ID, MENU_EXIT_TEXT);
@@ -1991,16 +2049,14 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                         HBITMAP hImage = clipboard_images[imageIndex].get();
                                         BITMAP bm;
                                         if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
-                                            // IMPORTANTE: Actualizar currentY con la altura real de la imagen
-                                            currentY += bm.bmHeight + 5;
-                                        } else {
-                                            currentY += lineHeight; // Fallback si no se puede obtener altura
+                                            // El cursor debe estar después de la imagen
+                                            cursorY = currentY + bm.bmHeight + 5;
+                                            cursorX = textBoxX + 10; // Al inicio de la siguiente línea
                                         }
-                                                                            } else {
-                                            currentY += lineHeight; // Fallback si no se encuentra la imagen
-                                        }
+                                    }
                                 } catch (...) {
-                                    currentY += lineHeight; // Fallback si hay error
+                                    cursorY = currentY + 20;
+                                    cursorX = textBoxX + 10;
                                 }
                             } else {
                                 currentY += lineHeight; // Fallback si no se puede parsear
@@ -2408,7 +2464,7 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
         // Captura de pantalla
         RECT screenshotRect = {90, currentY, width - 50, currentY + 20};
         SetTextColor(hMemDC, RGB(255, 150, 150)); // Rosa para destacar
-        DrawTextW(hMemDC, L"📸 Ctrl+Enter = Screenshot mode", -1, &screenshotRect, DT_LEFT | DT_TOP);
+        DrawTextW(hMemDC, L"📸 Shift+Alt+X (overlay activo) = Screenshot mode", -1, &screenshotRect, DT_LEFT | DT_TOP);
         currentY += 25;
         RECT screenshotDescRect = {90, currentY, width - 50, currentY + 20};
         SetTextColor(hMemDC, RGB(150, 150, 150)); // Gris medio
@@ -3279,14 +3335,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                     }
                     needsRedraw.store(true);
                 }
-            // Ctrl+Enter para captura de pantalla
+            // Ctrl+Enter para captura de pantalla (ahora deshabilitado - usar Shift+Alt+X cuando overlay está activo)
             } else if (wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000)) {
-                // Activar modo captura de pantalla
-                screenshot_mode.store(true);
-                drawing_active.store(false);
-                current_drawing_tool.store(DrawingTool::None);
-                text_input_mode.store(false);
-                needsRedraw.store(true);
+                // Deshabilitado: ahora usar Shift+Alt+X cuando el overlay está activo
+                // Mantener para compatibilidad pero no hacer nada
+                printf("ℹ️ Ctrl+Enter deshabilitado - usar Shift+Alt+X cuando overlay está activo\n");
                 return 0;
             } else if (wParam == 'T' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 // Ctrl+T para activar modo texto (con o sin zoom)
@@ -4498,13 +4551,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             printf("🔥 Hotkey recibido: %d\n", (int)wParam);
             switch (wParam) {
                 case 1: // Shift+Alt+X
-                    printf("🎯 Activando overlay (Shift+Alt+X)\n");
+                    printf("🎯 Hotkey Shift+Alt+X presionado\n");
                     if (!overlay_active.load()) {
                         printf("🚀 Iniciando thread de overlay...\n");
                         std::thread overlay_thread(ShowOverlay);
                         overlay_thread.detach();
                     } else {
-                        printf("⚠️ Overlay ya está activo\n");
+                        printf("📸 Overlay activo - Activando modo captura de pantalla\n");
+                        // Activar modo captura de pantalla cuando el overlay ya está activo
+                        screenshot_mode.store(true);
+                        drawing_active.store(false);
+                        current_drawing_tool.store(DrawingTool::None);
+                        text_input_mode.store(false);
+                        needsRedraw.store(true);
                     }
                     break;
                 default:
@@ -4571,6 +4630,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                             L"Error", 
                             MB_OK | MB_ICONERROR);
                     }
+                    break;
+                    
+                case 1007: // Estado del Auto-Inicio
+                    printf("🔍 Mostrando estado detallado del auto-inicio...\n");
+                    ShowAutoStartStatus();
+                    MessageBoxW(hMainWnd, 
+                        L"Se ha mostrado información detallada del estado del auto-inicio en la consola.\n\n"
+                        L"Si no ves la consola, ejecuta el programa con la opción 'Debug con consola'.",
+                        L"Estado del Auto-Inicio", 
+                        MB_OK | MB_ICONINFORMATION);
                     break;
                     
                 case MENU_EXIT_ID: // Salir
@@ -4651,6 +4720,66 @@ bool RequestAdminPrivileges() {
     }
     
     return false;
+}
+
+// Función para mostrar información detallada del estado del auto-inicio
+void ShowAutoStartStatus() {
+    printf("\n🔍 === ESTADO DETALLADO DEL AUTO-INICIO ===\n");
+    
+    // Verificar permisos de administrador
+    bool isAdmin = IsRunningAsAdministrator();
+    printf("👤 Permisos de administrador: %s\n", isAdmin ? "✅ SÍ" : "❌ NO");
+    
+    // Verificar si está habilitado
+    bool isEnabled = IsAutoStartEnabled();
+    printf("🚀 Auto-inicio habilitado: %s\n", isEnabled ? "✅ SÍ" : "❌ NO");
+    
+    // Mostrar información del registro
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
+        0, KEY_READ, &hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        printf("📋 Clave del registro: ✅ Accesible\n");
+        
+        if (isEnabled) {
+            wchar_t valueData[MAX_PATH];
+            DWORD dataSize = sizeof(valueData);
+            DWORD dataType = REG_SZ;
+            
+            result = RegQueryValueExW(hKey, L"Screen Highlighter", NULL, &dataType, 
+                                     (LPBYTE)valueData, &dataSize);
+            
+            if (result == ERROR_SUCCESS) {
+                printf("📁 Ruta en el registro: %ls\n", valueData);
+                
+                // Verificar si el archivo existe
+                DWORD fileAttributes = GetFileAttributesW(valueData);
+                if (fileAttributes != INVALID_FILE_ATTRIBUTES) {
+                    printf("✅ Archivo ejecutable: Existe y es accesible\n");
+                } else {
+                    printf("❌ Archivo ejecutable: No existe o no es accesible\n");
+                }
+            } else {
+                printf("❌ Error al leer valor del registro: %ld\n", result);
+            }
+        }
+        
+        RegCloseKey(hKey);
+    } else {
+        printf("📋 Clave del registro: ❌ No accesible (Error: %ld)\n", result);
+    }
+    
+    // Mostrar ruta actual del ejecutable
+    wchar_t currentExePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, currentExePath, MAX_PATH) > 0) {
+        printf("📁 Ruta actual del ejecutable: %ls\n", currentExePath);
+    } else {
+        printf("❌ No se pudo obtener la ruta del ejecutable\n");
+    }
+    
+    printf("===========================================\n\n");
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -4771,6 +4900,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     } else {
         printf("🚫 Auto-ejecución al iniciar sesión: DESHABILITADA\n");
     }
+    
+    // Mostrar estado detallado del auto-inicio
+    ShowAutoStartStatus();
     
     // Iniciar monitoreo de explorer.exe para restauración automática del system tray
     printf("🔍 Iniciando monitoreo de explorer.exe...\n");
