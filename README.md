@@ -2,6 +2,8 @@
 
 **Screen Highlighter** is a complete Win32 C++ application for screen capture, annotation, and highlighting. The project has been completely refactored and optimized with a professional build system.
 
+https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
+
 ## 🆕 **Version 2.0.0 - New Features**
 
 ### **🔍 Enhanced Zoom Experience**
