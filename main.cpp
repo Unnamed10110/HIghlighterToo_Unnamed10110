@@ -886,7 +886,7 @@ std::expected<GifElement, std::string> LoadGifFromFile(const std::wstring& fileP
         // Verificar que sea un GIF
         if (image->GetFrameDimensionsCount() == 0) {
             delete image;
-            return std::unexpected("El archivo no es un GIF válido");
+            return std::unexpected("The file is not a valid GIF");
         }
         
         // Obtener dimensiones del frame
@@ -1116,7 +1116,7 @@ HICON LoadIconFromFile(int size) {
 
 // Función para agregar el icono al system tray
 bool AddToSystemTray() {
-    printf("  🖼️ Configurando icono del system tray...\n");
+    printf("  🖼️ Configuring system tray icon...\n");
     
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
@@ -1138,7 +1138,7 @@ bool AddToSystemTray() {
     }
     
     strcpy_s(nid.szTip, TRAY_TOOLTIP_TEXT);
-    printf("  💬 Tooltip configurado: %s\n", TRAY_TOOLTIP_TEXT);
+    printf("  💬 Tooltip configured: %s\n", TRAY_TOOLTIP_TEXT);
     
     printf("  🔧 Agregando icono al system tray...\n");
     if (!Shell_NotifyIcon(NIM_ADD, &nid)) {
@@ -1207,7 +1207,7 @@ void MonitorExplorerProcess() {
                     
                     if (waitResult == WAIT_OBJECT_0) {
                         // Explorer.exe terminó
-                        printf("⚠️ Explorer.exe terminó - Restaurando system tray...\n");
+                        printf("⚠️ Explorer.exe terminated - Restoring system tray...\n");
                         systemTrayRestorationNeeded.store(true);
                         
                         // Esperar a que explorer.exe se reinicie
@@ -1215,7 +1215,7 @@ void MonitorExplorerProcess() {
                         
                         // Restaurar el icono del system tray
                         if (RestoreSystemTrayIcon()) {
-                            printf("✅ System tray restaurado después del reinicio de explorer.exe\n");
+                            printf("✅ System tray restored after explorer.exe restart\n");
                         } else {
                             printf("❌ Error al restaurar system tray\n");
                         }
@@ -1305,7 +1305,7 @@ bool IsAutoStartEnabled() {
         0, KEY_READ, &hKey);
     
     if (result != ERROR_SUCCESS) {
-        printf("❌ Error al abrir clave del registro para verificar auto-ejecución: %ld\n", result);
+        printf("❌ Error opening registry key to verify auto-start: %ld\n", result);
         return false;
     }
     
@@ -1320,24 +1320,24 @@ bool IsAutoStartEnabled() {
     RegCloseKey(hKey);
     
     if (result == ERROR_SUCCESS) {
-        printf("✅ Valor de auto-ejecución encontrado: %ls\n", valueData);
+        printf("✅ Auto-start value found: %ls\n", valueData);
         return true;
     } else if (result == ERROR_FILE_NOT_FOUND) {
-        printf("ℹ️ Valor de auto-ejecución no encontrado\n");
+        printf("ℹ️ Auto-start value not found\n");
         return false;
     } else {
-        printf("❌ Error al leer valor de auto-ejecución: %ld\n", result);
+        printf("❌ Error reading auto-start value: %ld\n", result);
         return false;
     }
 }
 
 // Función para habilitar la auto-ejecución al iniciar sesión
 bool EnableAutoStart() {
-    printf("🔧 Intentando habilitar auto-ejecución...\n");
+    printf("🔧 Attempting to enable auto-start...\n");
     
     // Verificar permisos de administrador
     if (!IsRunningAsAdministrator()) {
-        printf("❌ Se requieren permisos de administrador para configurar auto-inicio\n");
+        printf("❌ Administrator privileges required to configure auto-start\n");
         return false;
     }
     
@@ -1347,7 +1347,7 @@ bool EnableAutoStart() {
         0, KEY_WRITE, &hKey);
     
     if (result != ERROR_SUCCESS) {
-        printf("❌ Error al abrir clave del registro para auto-ejecución: %ld\n", result);
+        printf("❌ Error opening registry key for auto-start: %ld\n", result);
         return false;
     }
     
@@ -1376,29 +1376,29 @@ bool EnableAutoStart() {
     RegCloseKey(hKey);
     
     if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-ejecución habilitada exitosamente en el registro\n");
+        printf("✅ Auto-start enabled successfully in registry\n");
         
         // Verificar que se escribió correctamente
         if (IsAutoStartEnabled()) {
-            printf("✅ Verificación exitosa: auto-ejecución está habilitada\n");
+            printf("✅ Verification successful: auto-start is enabled\n");
             return true;
         } else {
-            printf("⚠️ Auto-ejecución se escribió pero no se puede verificar\n");
+            printf("⚠️ Auto-start was written but cannot be verified\n");
             return false;
         }
     } else {
-        printf("❌ Error al configurar auto-ejecución en el registro: %ld\n", result);
+        printf("❌ Error configuring auto-start in registry: %ld\n", result);
         return false;
     }
 }
 
 // Función para deshabilitar la auto-ejecución al iniciar sesión
 bool DisableAutoStart() {
-    printf("🔧 Intentando deshabilitar auto-ejecución...\n");
+    printf("🔧 Attempting to disable auto-start...\n");
     
     // Verificar permisos de administrador
     if (!IsRunningAsAdministrator()) {
-        printf("❌ Se requieren permisos de administrador para configurar auto-inicio\n");
+        printf("❌ Administrator privileges required to configure auto-start\n");
         return false;
     }
     
@@ -1408,7 +1408,7 @@ bool DisableAutoStart() {
         0, KEY_WRITE, &hKey);
     
     if (result != ERROR_SUCCESS) {
-        printf("❌ Error al abrir clave del registro para auto-ejecución: %ld\n", result);
+        printf("❌ Error opening registry key for auto-start: %ld\n", result);
         return false;
     }
     
@@ -1418,21 +1418,21 @@ bool DisableAutoStart() {
     RegCloseKey(hKey);
     
     if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-ejecución deshabilitada exitosamente del registro\n");
+        printf("✅ Auto-start disabled successfully from registry\n");
         
         // Verificar que se eliminó correctamente
         if (!IsAutoStartEnabled()) {
-            printf("✅ Verificación exitosa: auto-ejecución está deshabilitada\n");
+            printf("✅ Verification successful: auto-start is disabled\n");
             return true;
         } else {
-            printf("⚠️ Auto-ejecución se eliminó pero no se puede verificar\n");
+            printf("⚠️ Auto-start was removed but cannot be verified\n");
             return false;
         }
     } else if (result == ERROR_FILE_NOT_FOUND) {
-        printf("ℹ️ Auto-ejecución ya estaba deshabilitada\n");
+        printf("ℹ️ Auto-start was already disabled\n");
         return true;
     } else {
-        printf("❌ Error al deshabilitar auto-ejecución del registro: %ld\n", result);
+        printf("❌ Error disabling auto-start from registry: %ld\n", result);
         return false;
     }
 }
@@ -1449,13 +1449,13 @@ void ShowTrayMenu() {
     // Agregar opciones de auto-ejecución
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     if (IsAutoStartEnabled()) {
-        AppendMenuW(hMenu, MF_STRING, MENU_DISABLE_AUTOSTART_ID, L"🚫 Deshabilitar Auto-Inicio");
+        AppendMenuW(hMenu, MF_STRING, MENU_DISABLE_AUTOSTART_ID, L"🚫 Disable Auto-Start");
     } else {
-        AppendMenuW(hMenu, MF_STRING, MENU_ENABLE_AUTOSTART_ID, L"✅ Habilitar Auto-Inicio");
+        AppendMenuW(hMenu, MF_STRING, MENU_ENABLE_AUTOSTART_ID, L"✅ Enable Auto-Start");
     }
     
-    // Agregar opción para mostrar estado detallado
-    AppendMenuW(hMenu, MF_STRING, 1007, L"🔍 Estado del Auto-Inicio");
+    // Add option to show detailed status
+    AppendMenuW(hMenu, MF_STRING, 1007, L"🔍 Auto-Start Status");
     
     AppendMenuW(hMenu, MF_SEPARATOR, MENU_SEPARATOR_ID, MENU_SEPARATOR_TEXT);
     AppendMenuW(hMenu, MF_STRING, MENU_EXIT_ID, MENU_EXIT_TEXT);
@@ -1818,7 +1818,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         
         // Debug: mostrar información del zoom
         wchar_t debugMsg[256];
-        swprintf_s(debugMsg, L"DEBUG: Zoom activo - Original: %dx%d, Zoom: %.2f, Zoomed: %dx%d\n", 
+        swprintf_s(debugMsg, L"DEBUG: Zoom active - Original: %dx%d, Zoom: %.2f, Zoomed: %dx%d\n", 
                    originalWidth, originalHeight, zoom, zoomedWidth, zoomedHeight);
         OutputDebugStringW(debugMsg);
         
@@ -1837,7 +1837,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                        hZoomedDC.get(), 0, 0, originalWidth, originalHeight, SRCCOPY);
         if (!stretchResult) {
             wchar_t errorMsg[256];
-            swprintf_s(errorMsg, L"DEBUG: StretchBlt falló - Error: %d\n", GetLastError());
+            swprintf_s(errorMsg, L"DEBUG: StretchBlt failed - Error: %d\n", GetLastError());
             OutputDebugStringW(errorMsg);
         } else {
             OutputDebugStringW(L"DEBUG: StretchBlt exitoso\n");
@@ -2955,7 +2955,7 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
         // Captura de pantalla
         RECT screenshotRect = {90, currentY, width - 50, currentY + 20};
         SetTextColor(hMemDC, RGB(255, 150, 150)); // Rosa para destacar
-        DrawTextW(hMemDC, L"📸 Shift+Alt+X (overlay activo) = Screenshot mode", -1, &screenshotRect, DT_LEFT | DT_TOP);
+        DrawTextW(hMemDC, L"📸 Shift+Alt+X (overlay active) = Screenshot mode", -1, &screenshotRect, DT_LEFT | DT_TOP);
         currentY += 25;
         RECT screenshotDescRect = {90, currentY, width - 50, currentY + 20};
         SetTextColor(hMemDC, RGB(150, 150, 150)); // Gris medio
@@ -3289,11 +3289,11 @@ void CaptureZoomRegion(const ScreenRectangle& rect) {
     BOOL captureResult = BitBlt(hZoomedDC.get(), 0, 0, width, height, hScreenDC, rect.x1, rect.y1, SRCCOPY);
     if (!captureResult) {
         wchar_t errorMsg[256];
-        swprintf_s(errorMsg, L"DEBUG: Captura falló - Error: %d\n", GetLastError());
+        swprintf_s(errorMsg, L"DEBUG: Capture failed - Error: %d\n", GetLastError());
         OutputDebugStringW(errorMsg);
     } else {
         wchar_t successMsg[256];
-        swprintf_s(successMsg, L"DEBUG: Captura exitosa - Región: %dx%d en (%d,%d)\n", width, height, rect.x1, rect.y1);
+        swprintf_s(successMsg, L"DEBUG: Capture successful - Region: %dx%d at (%d,%d)\n", width, height, rect.x1, rect.y1);
         OutputDebugStringW(successMsg);
     }
     
@@ -3881,7 +3881,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             } else if (wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 // Deshabilitado: ahora usar Shift+Alt+X cuando el overlay está activo
                 // Mantener para compatibilidad pero no hacer nada
-                printf("ℹ️ Ctrl+Enter deshabilitado - usar Shift+Alt+X cuando overlay está activo\n");
+                printf("ℹ️ Ctrl+Enter disabled - use Shift+Alt+X when overlay is active\n");
                 return 0;
             } else if (wParam == 'T' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 // Ctrl+T para activar modo texto (con o sin zoom)
@@ -5109,7 +5109,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                         std::thread overlay_thread(ShowOverlay);
                         overlay_thread.detach();
                     } else {
-                        printf("📸 Overlay activo - Activando modo captura de pantalla\n");
+                        printf("📸 Overlay active - Activating screenshot mode\n");
                         // Activar modo captura de pantalla cuando el overlay ya está activo
                         screenshot_mode.store(true);
                         drawing_active.store(false);
@@ -5152,45 +5152,45 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     break;
                     
                 case MENU_ENABLE_AUTOSTART_ID: // Habilitar Auto-Inicio
-                    printf("🚀 Habilitando auto-ejecución al iniciar sesión...\n");
+                    printf("🚀 Enabling auto-start on login...\n");
                     if (EnableAutoStart()) {
                         MessageBoxW(hMainWnd, 
-                            L"Auto-ejecución habilitada exitosamente.\n\n"
-                            L"La aplicación se ejecutará automáticamente cada vez que inicies sesión en Windows.",
-                            L"Auto-Inicio Habilitado", 
+                            L"Auto-start enabled successfully.\n\n"
+                            L"The application will run automatically every time you log into Windows.",
+                            L"Auto-Start Enabled", 
                             MB_OK | MB_ICONINFORMATION);
                     } else {
                         MessageBoxW(hMainWnd, 
-                            L"Error al habilitar auto-ejecución.\n\n"
-                            L"Verifica que tengas permisos de administrador.",
+                            L"Error enabling auto-start.\n\n"
+                            L"Please verify that you have administrator privileges.",
                             L"Error", 
                             MB_OK | MB_ICONERROR);
                     }
                     break;
                     
                 case MENU_DISABLE_AUTOSTART_ID: // Deshabilitar Auto-Inicio
-                    printf("🚫 Deshabilitando auto-ejecución al iniciar sesión...\n");
+                    printf("🚫 Disabling auto-start on login...\n");
                     if (DisableAutoStart()) {
                         MessageBoxW(hMainWnd, 
-                            L"Auto-ejecución deshabilitada exitosamente.\n\n"
-                            L"La aplicación ya no se ejecutará automáticamente al iniciar sesión.",
-                            L"Auto-Inicio Deshabilitado", 
+                            L"Auto-start disabled successfully.\n\n"
+                            L"The application will no longer run automatically when logging in.",
+                            L"Auto-Start Disabled", 
                             MB_OK | MB_ICONINFORMATION);
                     } else {
                         MessageBoxW(hMainWnd, 
-                            L"Error al deshabilitar auto-ejecución.",
+                            L"Error disabling auto-start.",
                             L"Error", 
                             MB_OK | MB_ICONERROR);
                     }
                     break;
                     
                 case 1007: // Estado del Auto-Inicio
-                    printf("🔍 Mostrando estado detallado del auto-inicio...\n");
+                    printf("🔍 Showing detailed auto-start status...\n");
                     ShowAutoStartStatus();
                     MessageBoxW(hMainWnd, 
-                        L"Se ha mostrado información detallada del estado del auto-inicio en la consola.\n\n"
-                        L"Si no ves la consola, ejecuta el programa con la opción 'Debug con consola'.",
-                        L"Estado del Auto-Inicio", 
+                        L"Detailed auto-start status information has been displayed in the console.\n\n"
+                        L"If you don't see the console, run the program with the 'Debug with console' option.",
+                        L"Auto-Start Status", 
                         MB_OK | MB_ICONINFORMATION);
                     break;
                     
@@ -5280,11 +5280,11 @@ void ShowAutoStartStatus() {
     
     // Verificar permisos de administrador
     bool isAdmin = IsRunningAsAdministrator();
-    printf("👤 Permisos de administrador: %s\n", isAdmin ? "✅ SÍ" : "❌ NO");
+    printf("👤 Administrator privileges: %s\n", isAdmin ? "✅ YES" : "❌ NO");
     
     // Verificar si está habilitado
     bool isEnabled = IsAutoStartEnabled();
-    printf("🚀 Auto-inicio habilitado: %s\n", isEnabled ? "✅ SÍ" : "❌ NO");
+    printf("🚀 Auto-start enabled: %s\n", isEnabled ? "✅ YES" : "❌ NO");
     
     // Mostrar información del registro
     HKEY hKey;
@@ -5341,29 +5341,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Verificar permisos de administrador
     if (!IsRunningAsAdministrator()) {
-        printf("⚠️ La aplicación requiere permisos de administrador\n");
-        printf("🔐 Solicitando elevación de privilegios...\n");
+        printf("⚠️ Application requires administrator privileges\n");
+        printf("🔐 Requesting privilege elevation...\n");
         
         if (RequestAdminPrivileges()) {
-            printf("✅ Permisos de administrador solicitados exitosamente\n");
-            printf("🔄 Cerrando instancia actual...\n");
+            printf("✅ Administrator privileges requested successfully\n");
+            printf("🔄 Closing current instance...\n");
             return 0; // Cerrar esta instancia
         } else {
-            printf("❌ No se pudieron obtener permisos de administrador\n");
+            printf("❌ Could not obtain administrator privileges\n");
             MessageBoxW(NULL, 
-                L"Screen Highlighter requiere permisos de administrador para funcionar correctamente.\n\n"
-                L"Por favor, ejecuta la aplicación como administrador.",
-                L"Permisos Requeridos", 
+                L"Screen Highlighter requires administrator privileges to function correctly.\n\n"
+                L"Please run the application as administrator.",
+                L"Privileges Required", 
                 MB_OK | MB_ICONWARNING);
             return 1;
         }
     }
     
-    printf("✅ Permisos de administrador verificados\n");
+    printf("✅ Administrator privileges verified\n");
     
     // Cargar configuración desde archivo .ini al inicio
     LoadConfiguration();
-    printf("✅ Configuración cargada\n");
+    printf("✅ Configuration loaded\n");
                 
     // Crear una ventana oculta para manejar mensajes
     WNDCLASSEXW wc = {};
@@ -5448,9 +5448,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Verificar estado de auto-ejecución
     if (IsAutoStartEnabled()) {
-        printf("🚀 Auto-ejecución al iniciar sesión: HABILITADA\n");
+        printf("🚀 Auto-start on login: ENABLED\n");
     } else {
-        printf("🚫 Auto-ejecución al iniciar sesión: DESHABILITADA\n");
+        printf("🚫 Auto-start on login: DISABLED\n");
     }
     
     // Mostrar estado detallado del auto-inicio
@@ -5463,12 +5463,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Configurar timer para verificar periódicamente el system tray
     SetTimer(hMainWnd, 1, 30000, NULL); // Verificar cada 30 segundos
-    printf("⏰ Timer de verificación del system tray configurado\n");
+    printf("⏰ System tray verification timer configured\n");
     
     // Bucle principal del mensaje
-    printf("🔄 Iniciando bucle principal de mensajes...\n");
-    printf("💡 Presiona Shift+Alt+X para activar el highlight\n");
-    printf("💡 Busca el icono verde en el system tray\n");
+    printf("🔄 Starting main message loop...\n");
+    printf("💡 Press Shift+Alt+X to activate highlight\n");
+    printf("💡 Look for the green icon in the system tray\n");
     
     MSG msg;
     while (running.load() && GetMessage(&msg, NULL, 0, 0)) {
