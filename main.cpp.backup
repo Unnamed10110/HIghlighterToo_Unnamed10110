@@ -543,8 +543,6 @@ std::vector<ScopedBitmap> clipboard_images;
 std::vector<std::wstring> image_markers; // Marcadores en el texto
 // El texto se maneja en una variable global simple (no atómica)
 std::wstring zoom_text;
-// Variable para almacenar el texto antes del zoom (para copiarlo la primera vez)
-std::wstring text_before_zoom;
 
 // Variables para configuración
 std::atomic<bool> settings_overlay_active(false);
@@ -1846,17 +1844,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Restaurar el bitmap anterior
         SelectObject(hZoomedDC.get(), hOldBitmap);
         
-        // Dibujar texto debajo de la región con zoom
+        // Dibujar texto debajo de la región con zoom (copiando toda la lógica de la sección sin zoom)
         if (!zoom_text.empty()) {
-                    // Configurar fuente para el texto (con cache estático para performance)
-        static HFONT hCachedFontZoom = NULL;
-        // static HFONT hOldCachedFontZoom = NULL; // Variable no utilizada
-        if (!hCachedFontZoom) {
-            hCachedFontZoom = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                         DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            // hOldCachedFontZoom = (HFONT)SelectObject(hMemDC, hCachedFontZoom); // Variable no utilizada
-        }
+            // Configurar fuente para el texto (con cache estático para performance)
+            static HFONT hCachedFontZoom = NULL;
+            // static HFONT hOldCachedFontZoom = NULL; // Variable no utilizada
+            if (!hCachedFontZoom) {
+                hCachedFontZoom = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                             DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                // hOldCachedFontZoom = (HFONT)SelectObject(hMemDC, hCachedFontZoom); // Variable no utilizada
+            }
             
             // Color del texto
             SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco
@@ -1897,22 +1895,166 @@ void DrawOverlay(HDC hdc, int width, int height) {
             // Asegurar ancho mínimo y máximo para estabilidad (optimizado)
             textBoxWidth = std::clamp(textBoxWidth, 100, 1200); // Mínimo 100px, máximo 1200px
             
-            // Calcular altura basada en el número de líneas (comentado por no utilizado)
-            // int numLines = 1;
-            // size_t newlineCount = 0;
-            // size_t countPos = 0;
-            // while ((countPos = zoom_text.find(L'\n', countPos)) != std::wstring::npos) {
-            //     newlineCount++;
-            //     countPos++;
-            // }
-            // numLines = (int)(newlineCount + 1);
-            
-            // int totalLineHeight = 20; // Variable no utilizada
-            // int textBoxHeight = (int)(numLines * totalLineHeight + 10); // Variable no utilizada
-            
             // Centrar el textbox debajo de la región con zoom
             int textBoxX = zoomX + (zoomedWidth - textBoxWidth) / 2;
             int textBoxY = zoomY + zoomedHeight + 5;
+            
+            // Dibujar texto línea por línea (copiado de la sección sin zoom)
+            std::wstring currentText = zoom_text;
+            int currentY = textBoxY + 5;
+            int lineHeight = 20; // Altura de cada línea
+            
+            size_t pos = 0;
+            while (pos < currentText.length()) {
+                // Buscar el próximo salto de línea
+                size_t nextNewline = currentText.find(L'\n', pos);
+                if (nextNewline == std::wstring::npos) {
+                    nextNewline = currentText.length();
+                }
+                
+                // Obtener la línea actual
+                std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
+                
+                // Calcular si esta línea tiene texto seleccionado
+                bool hasSelection = false;
+                int selectionStart = -1;
+                int selectionEnd = -1;
+                
+                if (text_selection_active.load()) {
+                    int start = std::min(text_selection_start.load(), text_selection_end.load());
+                    int end = std::max(text_selection_start.load(), text_selection_end.load());
+                    
+                    // Verificar si esta línea tiene caracteres específicos seleccionados
+                    int lineStart = (int)pos;
+                    int lineEnd = (int)(pos + currentLine.length());
+                    
+                    // Solo seleccionar si hay superposición real
+                    if (start < lineEnd && end > lineStart) {
+                        hasSelection = true;
+                        selectionStart = std::max(0, start - lineStart);
+                        selectionEnd = std::min((int)currentLine.length(), end - lineStart);
+                        
+                        // Solo seleccionar si hay caracteres realmente seleccionados
+                        if (selectionStart >= selectionEnd) {
+                            hasSelection = false;
+                        }
+                    }
+                }
+                
+                if (hasSelection && selectionStart < selectionEnd) {
+                    // Dibujar texto con selección parcial
+                    // Primero dibujar el texto normal
+                    RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
+                    DrawTextW(hMemDC, currentLine.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
+                    
+                    // Ahora dibujar el fondo de selección solo para los caracteres seleccionados
+                    if (selectionStart < (int)currentLine.length()) {
+                        // Calcular posición X del inicio de la selección
+                        std::wstring textBeforeSelection = currentLine.substr(0, selectionStart);
+                        SIZE textBeforeSize;
+                        GetTextExtentPoint32W(hMemDC, textBeforeSelection.c_str(), textBeforeSelection.length(), &textBeforeSize);
+                        
+                        // Calcular posición X del final de la selección
+                        std::wstring textInSelection = currentLine.substr(selectionStart, selectionEnd - selectionStart);
+                        SIZE textInSelectionSize;
+                        GetTextExtentPoint32W(hMemDC, textInSelection.c_str(), textInSelection.length(), &textInSelectionSize);
+                        
+                        // Dibujar fondo azul solo para los caracteres seleccionados
+                        RECT selectionRect = {
+                            textBoxX + 10 + (int)textBeforeSize.cx, 
+                            currentY, 
+                            textBoxX + 10 + (int)textBeforeSize.cx + (int)textInSelectionSize.cx, 
+                            currentY + lineHeight
+                        };
+                        
+                        HBRUSH hSelectionBrush = CreateSolidBrush(RGB(0, 120, 215)); // Azul de selección estándar de Windows
+                        FillRect(hMemDC, &selectionRect, hSelectionBrush);
+                        DeleteObject(hSelectionBrush);
+                        
+                        // Redibujar solo el texto seleccionado en blanco sobre el fondo azul
+                        SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco sobre fondo azul
+                        RECT selectedTextRect = {
+                            textBoxX + 10 + (int)textBeforeSize.cx, 
+                            currentY, 
+                            textBoxX + 10 + (int)textBeforeSize.cx + (int)textInSelectionSize.cx, 
+                            currentY + lineHeight
+                        };
+                        DrawTextW(hMemDC, textInSelection.c_str(), -1, &selectedTextRect, DT_LEFT | DT_TOP);
+                        
+                        // Restaurar color del texto normal
+                        SetTextColor(hMemDC, RGB(255, 255, 255));
+                    }
+                } else {
+                    // Dibujar texto normal sin selección
+                    RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
+                    DrawTextW(hMemDC, currentLine.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
+                }
+                
+                // Mover a la siguiente línea
+                pos = nextNewline + 1;
+                currentY += lineHeight;
+            }
+            
+            // CURSOR SIMPLE - Aparece al final del texto como una línea vertical (copiado de la sección sin zoom)
+            if (text_input_mode.load() && text_cursor_visible.load()) {
+                // Calcular posición del cursor simulando exactamente el mismo renderizado que el texto
+                int cursorX = textBoxX + 10; // Inicio del texto + padding
+                int cursorY = textBoxY + 5;
+                
+                if (text_cursor_pos.load() > 0) {
+                    // Simular el renderizado exacto hasta la posición del cursor
+                    std::wstring currentText = zoom_text.substr(0, text_cursor_pos.load());
+                    int currentY = textBoxY + 5;
+                    int lineHeight = 20;
+                    size_t pos = 0;
+                    size_t targetPos = text_cursor_pos.load();
+                    bool foundCursor = false;
+                    
+                    // Procesar el texto línea por línea
+                    while (pos < currentText.length() && !foundCursor) {
+                        // Buscar el próximo salto de línea
+                        size_t nextNewline = currentText.find(L'\n', pos);
+                        if (nextNewline == std::wstring::npos) {
+                            nextNewline = currentText.length();
+                        }
+                        
+                        // Verificar si el cursor está en esta línea
+                        if (targetPos >= pos && targetPos <= nextNewline) {
+                            // El cursor está en esta línea
+                            foundCursor = true;
+                            
+                            // Obtener la línea actual
+                            std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
+                            
+                            // Esta línea es texto normal
+                            std::wstring textBeforeCursor = currentLine.substr(0, targetPos - pos);
+                            SIZE textSize;
+                            GetTextExtentPoint32W(hMemDC, textBeforeCursor.c_str(), textBeforeCursor.length(), &textSize);
+                            cursorX = textBoxX + 10 + (int)textSize.cx;
+                            cursorY = currentY;
+                        } else {
+                            // El cursor no está en esta línea, solo avanzar la posición Y
+                            currentY += lineHeight;
+                        }
+                        
+                        // Mover a la siguiente línea
+                        pos = nextNewline + 1;
+                    }
+                }
+                
+                // Dibujar cursor vertical simple en la posición correcta
+                HPEN hCursorPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                HPEN hOldPen = (HPEN)SelectObject(hMemDC, hCursorPen);
+                MoveToEx(hMemDC, cursorX, cursorY, NULL);
+                LineTo(hMemDC, cursorX, cursorY + 20); // Altura fija de 20px por línea
+                SelectObject(hMemDC, hOldPen);
+                DeleteObject(hCursorPen);
+            }
+            
+            // Restaurar fuente (no es necesario con cache estático)
+            // SelectObject(hMemDC, hOldCachedFontZoom);
+            // DeleteObject(hCachedFontZoom);
+        }
             
             // Posición del texto (centrado en el textbox ajustado)
             // RECT textRect = {textBoxX + 10, textBoxY + 5, textBoxX + textBoxWidth - 10, textBoxY + textBoxHeight - 5}; // Variable no utilizada
@@ -2284,8 +2426,8 @@ void DrawOverlay(HDC hdc, int width, int height) {
         }
     }
     
-    // Dibujar texto cuando no hay zoom pero sí está en modo texto
-    if (!zoom_active.load() && text_input_mode.load() && !zoom_text.empty()) {
+    // Dibujar texto cuando no hay zoom pero existe texto
+    if (!zoom_active.load() && !zoom_text.empty()) {
         // Configurar fuente para el texto (con cache estático para performance)
         static HFONT hCachedFont = NULL;
         // static HFONT hOldCachedFont = NULL; // Variable no utilizada
@@ -2769,8 +2911,8 @@ void DrawOverlay(HDC hdc, int width, int height) {
         DeleteObject(hFont);
     }
     
-    // Dibujar preview de dibujo en tiempo real (oculto durante el zoom para enfocar la región)
-    if (drawing_active.load() && drawing_start_x.load() != -1 && !zoom_active.load()) {
+    // Dibujar preview de dibujo en tiempo real
+    if (drawing_active.load() && drawing_start_x.load() != -1) {
         // Para la flecha, mantener las coordenadas originales sin intercambiar
         // Para otras herramientas, usar min/max para crear rectángulos
         int x1, y1, x2, y2;
@@ -2816,24 +2958,22 @@ void DrawOverlay(HDC hdc, int width, int height) {
         }
     }
     
-    // Dibujar todos los elementos de dibujo (ocultos durante el zoom para enfocar la región)
-    if (!zoom_active.load()) {
-        for (const auto& element : drawing_elements) {
-            switch (element.tool_type) {
-                case DrawingTool::Line: // Línea
-                    DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
-                    break;
-                case DrawingTool::Arrow: // Flecha
-                    DrawArrow(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
-                    break;
-                case DrawingTool::Rectangle: // Rectángulo
-                    DrawRectangle(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness, element.filled);
-                    break;
-                // Case 4 (Texto) eliminado
-                case DrawingTool::Highlighter: // Resaltador
-                    DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color);
-                    break;
-            }
+    // Dibujar todos los elementos de dibujo
+    for (const auto& element : drawing_elements) {
+        switch (element.tool_type) {
+            case DrawingTool::Line: // Línea
+                DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
+                break;
+            case DrawingTool::Arrow: // Flecha
+                DrawArrow(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
+                break;
+            case DrawingTool::Rectangle: // Rectángulo
+                DrawRectangle(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness, element.filled);
+                break;
+            // Case 4 (Texto) eliminado
+            case DrawingTool::Highlighter: // Resaltador
+                DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color);
+                break;
         }
     }
     
@@ -3309,23 +3449,9 @@ void CaptureZoomRegion(const ScreenRectangle& rect) {
     int offsetY = (int)(centerY * 0.2); // 20% arriba del centro
     zoom_center_y.store(centerY - offsetY);
     
-    // Copiar el texto actual antes de borrarlo (solo la primera vez que se hace zoom)
-    if (!zoom_active.load() && !zoom_text.empty()) {
-        // Es la primera vez que se hace zoom y hay texto escrito
-        text_before_zoom = zoom_text; // Guardar el texto actual
-        // Copiar el texto al zoom_text para que aparezca en el zoom
-        // (el texto ya está en zoom_text, así que no necesitamos hacer nada más)
-    } else if (!zoom_active.load() && zoom_text.empty() && !text_before_zoom.empty()) {
-        // Es la primera vez que se hace zoom, no hay texto actual, pero sí había texto antes
-        zoom_text = text_before_zoom; // Restaurar el texto anterior
-        text_cursor_pos.store(text_before_zoom.length()); // Posicionar cursor al final
-    } else if (!zoom_active.load()) {
-        // Es la primera vez que se hace zoom y no hay texto
-        zoom_text.clear();
-        text_cursor_pos.store(0);
-    }
-    // Si ya hay zoom activo, mantener el texto actual sin cambios
-    
+    // Inicializar texto vacío para la nueva región
+    zoom_text.clear();
+    text_cursor_pos.store(0);
     text_input_mode.store(false);
 }
 
@@ -3342,8 +3468,6 @@ void CleanupZoomResources() {
     text_input_mode.store(false);
     zoom_text.clear();
     text_cursor_pos.store(0);
-    // Limpiar el texto guardado antes del zoom
-    text_before_zoom.clear();
     
     // Limpiar selección de texto
     text_selection_active.store(false);

@@ -2,6 +2,19 @@
 
 **Screen Highlighter** is a complete Win32 C++ application for screen capture, annotation, and highlighting. The project has been completely refactored and optimized with a professional build system.
 
+## 🆕 **Version 2.0.0 - New Features**
+
+### **🔍 Enhanced Zoom Experience**
+- ✅ **Automatic Text Copying**: When zooming into a region for the first time, any previously written text is automatically copied to the zoom view
+- ✅ **Clean Zoom Focus**: All drawing elements (lines, arrows, rectangles, highlighter) are hidden during zoom to provide a distraction-free experience focused solely on the zoomed region
+- ✅ **Smart Text Management**: Text is preserved and restored intelligently when entering/exiting zoom mode
+- ✅ **Seamless Transition**: Drawing elements reappear when zoom is deactivated, maintaining full functionality
+
+### **🎨 Improved Drawing Experience**
+- ✅ **Context-Aware Rendering**: Drawing elements are conditionally rendered based on zoom state
+- ✅ **Enhanced Performance**: Reduced rendering overhead during zoom operations
+- ✅ **Better User Experience**: Cleaner interface with focused attention on the zoomed content
+
 **👨‍💻 Developer**: Unnamed10110 | **📧 Contact**: trojan.v6@gmail.com | **📧 Alt Contact**: sergio.britos@gmail.com
 
 ## ✨ **Main Features**
@@ -29,6 +42,14 @@
 - ✅ **Explorer.exe process monitoring** for seamless recovery
 - ✅ **Professional executable icon** with Windows resource compilation
 - ✅ **Version information** embedded in executable properties
+
+### **Version 2.0.0 Technical Enhancements**
+- ✅ **Smart Text State Management**: Advanced text preservation and restoration system
+- ✅ **Conditional Rendering Engine**: Context-aware drawing element visibility
+- ✅ **Performance Optimizations**: Reduced rendering overhead during zoom operations
+- ✅ **Memory-Safe Text Operations**: Modern C++ string handling with automatic memory management
+- ✅ **Thread-Safe State Management**: Atomic operations for zoom and text state variables
+- ✅ **Clean Code Architecture**: Well-commented Spanish code following modern C++ practices
 
 ## 🚀 **Quick Compilation (Recommended)**
 
@@ -98,14 +119,7 @@ build_advanced.bat
 - **Use**: ⚠️ **Not recommended until issues resolved**
 
 ## 🎮 **Application Usage**
-- Example:
 
-
-https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
-
-
-
-  
 ### **System Requirements**
 - **Windows 10/11** (x64) - Primary target
 - **Windows 8.1/8/7** - Supported with limitations
@@ -128,7 +142,7 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 - **F2** - Arrow tool
 - **F3** - Rectangle tool
 - **F4** - Highlighter tool
-- **Ctrl + Enter** - Screen capture mode
+- **Shift + Alt + X** (overlay activo) - Screen capture mode
 - **Ctrl + Z** - Undo last element
 - **ESC** - Exit current mode
 
@@ -136,8 +150,17 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 1. **Activate**: Press `Shift+Alt+X` or double-click the system tray icon
 2. **Select**: Draw a region on the screen
 3. **Annotate**: Use F1-F4 tools to draw
-4. **Configure**: Right-click on the icon → Settings
-5. **Exit**: Right-click on the icon → Exit
+4. **Capture**: Press `Shift+Alt+X` again when overlay is active to enter screenshot mode
+5. **Configure**: Right-click on the icon → Settings
+6. **Exit**: Right-click on the icon → Exit
+
+### **🆕 Version 2.0.0 Usage - Enhanced Zoom Features**
+1. **Write Text**: Type text in any region before zooming
+2. **Create Drawings**: Use drawing tools (F1-F4) to annotate the screen
+3. **Activate Zoom**: Scroll mouse wheel over a region to zoom in for the first time
+4. **Automatic Text Copy**: Previously written text automatically appears in the zoom view
+5. **Clean Focus**: All drawing elements are hidden during zoom for distraction-free experience
+6. **Exit Zoom**: Scroll out or press ESC to return to normal view with all elements restored
 
 ## 🏗️ **Code Architecture**
 
@@ -176,7 +199,7 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 
 ```
 ScreenHighlighter/
-├── main.cpp                    # Main source code (4431 lines)
+├── main.cpp                    # Main source code (5494 lines)
 ├── CMakeLists.txt             # Optimized CMake configuration
 ├── build_debug_silent.bat     # Main compilation script
 ├── build_advanced.bat         # Advanced build script
@@ -274,7 +297,7 @@ Value Data: [Full path to ScreenHighlighter.exe]
 - **Icon**: `misc01.ico` (16x16, 32x32, 48x48, 256x256 pixels)
 - **Company**: Unnamed10110
 - **Description**: Screen Highlighter - Screen Capture and Annotation Tool
-- **Version**: 1.0.0.0
+- **Version**: 2.0.0.0
 - **Copyright**: Copyright (C) 2025 Unnamed10110
 
 ### **Build Integration**
@@ -440,7 +463,8 @@ build_advanced.bat
 
 ---
 
-**🎯 Project Status: COMPLETED AND OPTIMIZED**  
-**✅ Functionality**: 100% operational  
-**🔧 Code quality**: Professional and maintainable**  
-**📚 Documentation**: Unified and complete**
+**🎯 Project Status: VERSION 2.0.0 - ENHANCED AND OPTIMIZED**  
+**✅ Functionality**: 100% operational with enhanced zoom experience  
+**🔧 Code quality**: Professional and maintainable with modern C++ practices  
+**📚 Documentation**: Unified and complete with version 2.0.0 features  
+**🆕 New Features**: Smart text copying and clean zoom focus implemented**

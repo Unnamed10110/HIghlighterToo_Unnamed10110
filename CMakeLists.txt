@@ -2,8 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 project(ScreenHighlighter VERSION 1.0.0 LANGUAGES CXX)
 
 # Configurar estándar C++
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Configurar características específicas de C++23
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Opciones de compilación
 option(DEBUG_MODE "Compilar en modo debug sin mwindows" OFF)
@@ -17,13 +20,15 @@ if(WIN32)
     
     # Configurar flags de compilación específicos para el compilador
     if(MSVC)
-        # Visual Studio
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2")
-        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /Zi")
+        # Visual Studio - habilitar features de C++23
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /std:c++latest")
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /Zi /std:c++latest")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++latest")
     elseif(MINGW)
-        # MinGW
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2")
-        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+        # MinGW - habilitar features de C++23
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -std=c++23")
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g -std=c++23")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++23")
         
         # Solo usar mwindows si no está en modo debug y no se habilita consola
         if(NOT DEBUG_MODE AND NOT ENABLE_CONSOLE AND NOT SILENT_DEBUG)
@@ -31,8 +36,9 @@ if(WIN32)
         endif()
     else()
         # Otros compiladores
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2")
-        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -std=c++23")
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g -std=c++23")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++23")
     endif()
 endif()
 
@@ -50,6 +56,9 @@ if(WIN32)
         winmm
         ole32
         uuid
+        gdiplus
+        shlwapi
+        windowscodecs
     )
 endif()
 
@@ -146,4 +155,5 @@ message(STATUS "Configurando ${PROJECT_NAME} v${PROJECT_VERSION}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Debug mode: ${DEBUG_MODE}")
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "C++ Extensions: ${CMAKE_CXX_EXTENSIONS}")
 message(STATUS "Output directory: ${CMAKE_BINARY_DIR}/bin")
