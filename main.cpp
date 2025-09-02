@@ -2769,8 +2769,8 @@ void DrawOverlay(HDC hdc, int width, int height) {
         DeleteObject(hFont);
     }
     
-    // Dibujar preview de dibujo en tiempo real (oculto durante el zoom para enfocar la región)
-    if (drawing_active.load() && drawing_start_x.load() != -1 && !zoom_active.load()) {
+    // Dibujar preview de dibujo en tiempo real (funciona también durante el zoom)
+    if (drawing_active.load() && drawing_start_x.load() != -1) {
         // Para la flecha, mantener las coordenadas originales sin intercambiar
         // Para otras herramientas, usar min/max para crear rectángulos
         int x1, y1, x2, y2;
@@ -2816,24 +2816,22 @@ void DrawOverlay(HDC hdc, int width, int height) {
         }
     }
     
-    // Dibujar todos los elementos de dibujo (ocultos durante el zoom para enfocar la región)
-    if (!zoom_active.load()) {
-        for (const auto& element : drawing_elements) {
-            switch (element.tool_type) {
-                case DrawingTool::Line: // Línea
-                    DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
-                    break;
-                case DrawingTool::Arrow: // Flecha
-                    DrawArrow(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
-                    break;
-                case DrawingTool::Rectangle: // Rectángulo
-                    DrawRectangle(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness, element.filled);
-                    break;
-                // Case 4 (Texto) eliminado
-                case DrawingTool::Highlighter: // Resaltador
-                    DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color);
-                    break;
-            }
+    // Dibujar todos los elementos de dibujo (funciona también durante el zoom)
+    for (const auto& element : drawing_elements) {
+        switch (element.tool_type) {
+            case DrawingTool::Line: // Línea
+                DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
+                break;
+            case DrawingTool::Arrow: // Flecha
+                DrawArrow(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
+                break;
+            case DrawingTool::Rectangle: // Rectángulo
+                DrawRectangle(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness, element.filled);
+                break;
+            // Case 4 (Texto) eliminado
+            case DrawingTool::Highlighter: // Resaltador
+                DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color);
+                break;
         }
     }
     
