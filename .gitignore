@@ -1,132 +1,56 @@
-# Build directories
+# Archivos de compilación
 build/
-build_debug/
-build_debug_silent/
-build_release_console/
-build_advanced/
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
 
-# CMake generated files
+# Archivos de configuración generados
+ScreenHighlighter.ini
+admin_manifest.manifest
+
+# Archivos temporales
+*.tmp
+*.temp
+*.log
+*.cache
+
+# Archivos de sistema
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Archivos de backup
+*.backup
+*.bak
+*.old
+
+# Archivos multimedia innecesarios
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.mkv
+
+# Directorios de IDE
+.vs/
+.vscode/
+.idea/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Archivos de CMake
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
 *.cmake
-!CMakeLists.txt
-!config/CMakeConfig.cmake
-
-# Compiled executables
-*.exe
-*.out
-*.app
-
-# Object files
-*.o
-*.obj
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Temporary files
-*.tmp
-*.temp
-*.swp
-*.swo
-*~
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Logs
-*.log
-*.tlog
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Coverage directory used by tools like istanbul
-coverage/
-
-# nyc test coverage
-.nyc_output
-
-# Dependency directories
-node_modules/
-jspm_packages/
-
-# Optional npm cache directory
-.npm
-
-# Optional REPL history
-.node_repl_history
-
-# Output of 'npm pack'
-*.tgz
-
-# Yarn Integrity file
-.yarn-integrity
-
-# dotenv environment variables file
-.env
-
-# Screenshots and captures
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.bmp
-*.tiff
-
-# Configuration files (keep template, ignore generated)
-ScreenHighlighter.ini
-!config/ScreenHighlighter.ini.in
-
-# Manifest files
-*.manifest
-
-# Resource files
-*.rc
-*.ico

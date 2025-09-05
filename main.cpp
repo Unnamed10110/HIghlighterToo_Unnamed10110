@@ -15,19 +15,12 @@
 #include <memory>
 #include <stdexcept>
 #include <optional>
-// Headers modernos de C++23
+#include <unordered_map>
 #include <expected>
-#include <span>
-#include <ranges>
-#include <concepts>
-#include <coroutine>
-
 // Headers para soporte de GIFs
 #include <gdiplus.h>
 #include <objidl.h>
 #include <shlwapi.h>
-// Headers de seguridad para verificación de permisos
-#include <windows.h>
 
 // Optimizaciones de compilador para máxima performance
 // Nota: Los pragmas específicos de MSVC no son compatibles con g++
@@ -36,12 +29,232 @@
 // #pragma comment(lib, "comctl32.lib") // No soportado por g++
 
 // ============================================================================
-// CLASES RAII MODERNIZADAS PARA GESTIÓN SEGURA DE RECURSOS GDI
+// CLASES RAII OPTIMIZADAS PARA GESTIÓN SEGURA DE RECURSOS GDI
 // ============================================================================
 
-// Concepto para tipos de handle de Windows
-template<typename T>
-concept WindowsHandle = std::is_pointer_v<T> && std::is_integral_v<std::remove_pointer_t<T>>;
+// Cache estático para recursos GDI comúnmente usados (optimización de performance)
+namespace GdiCache {
+    // Declaración forward
+    struct TextLine;
+    
+    // Fuentes cacheadas
+    static HFONT hCachedFontZoom = nullptr;
+    static HFONT hCachedFont = nullptr;
+    static HFONT hCachedFontIndicator = nullptr;
+    static HFONT hCachedFontScreenshot = nullptr;
+    
+    // Pinceles cacheados para colores comunes
+    static HBRUSH hBlackBrush = nullptr;
+    static HBRUSH hWhiteBrush = nullptr;
+    static HBRUSH hSelectionBrush = nullptr;
+    static HBRUSH hOverlayBrush = nullptr;
+    
+    // Lápices cacheados para colores comunes
+    static HPEN hWhitePen = nullptr;
+    static HPEN hCursorPen = nullptr;
+    static HPEN hModernPen = nullptr;
+    
+    // Cache para mediciones de texto (optimización de performance)
+    static std::unordered_map<std::wstring, SIZE> textSizeCache;
+    
+    // Cache para dimensiones de bitmaps (optimización de performance)
+    static std::unordered_map<HBITMAP, SIZE> bitmapSizeCache;
+    
+    // Cache para layout de texto (optimización de performance)
+    struct TextLayout {
+        std::vector<TextLine> lines;
+        int totalHeight;
+        int maxWidth;
+    };
+    static std::unordered_map<std::wstring, TextLayout> textLayoutCache;
+    
+    // Función optimizada para procesar texto línea por línea (reduce substr() calls)
+    
+    // Definición de TextLine dentro del namespace
+    struct TextLine {
+        std::wstring content;
+        size_t startPos;
+        size_t endPos;
+    };
+    
+    std::vector<TextLine> ProcessTextLines(const std::wstring& text) {
+        std::vector<TextLine> lines;
+        size_t pos = 0;
+        
+        while (pos < text.length()) {
+            size_t nextNewline = text.find(L'\n', pos);
+            if (nextNewline == std::wstring::npos) {
+                nextNewline = text.length();
+            }
+            
+            TextLine line;
+            line.startPos = pos;
+            line.endPos = nextNewline;
+            line.content = text.substr(pos, nextNewline - pos);
+            lines.push_back(line);
+            
+            pos = nextNewline + 1;
+        }
+        
+        return lines;
+    }
+    
+    // Función optimizada para obtener layout de texto con cache
+    TextLayout GetTextLayoutCached(const std::wstring& text) {
+        auto it = textLayoutCache.find(text);
+        if (it != textLayoutCache.end()) {
+            return it->second;
+        }
+        
+        TextLayout layout;
+        layout.lines = ProcessTextLines(text);
+        layout.totalHeight = 0;
+        layout.maxWidth = 0;
+        
+        for (const auto& line : layout.lines) {
+            layout.totalHeight += 20; // Altura estándar por línea
+            // El ancho máximo se calculará cuando sea necesario con GetTextSizeCached
+        }
+        
+        textLayoutCache[text] = layout;
+        return layout;
+    }
+    
+    // Función optimizada para obtener tamaño de texto con cache
+    SIZE GetTextSizeCached(HDC hdc, const std::wstring& text) {
+        auto it = textSizeCache.find(text);
+        if (it != textSizeCache.end()) {
+            return it->second;
+        }
+        
+        SIZE size;
+        GetTextExtentPoint32W(hdc, text.c_str(), text.length(), &size);
+        textSizeCache[text] = size;
+        return size;
+    }
+    
+    // Función optimizada para obtener dimensiones de bitmap con cache
+    SIZE GetBitmapSizeCached(HBITMAP hBitmap) {
+        auto it = bitmapSizeCache.find(hBitmap);
+        if (it != bitmapSizeCache.end()) {
+            return it->second;
+        }
+        
+        BITMAP bm;
+        SIZE size = {0, 0};
+        if (GetObject(hBitmap, sizeof(BITMAP), &bm) > 0) {
+            size.cx = bm.bmWidth;
+            size.cy = bm.bmHeight;
+            bitmapSizeCache[hBitmap] = size;
+        }
+        return size;
+    }
+    
+    // Limpiar cache de texto cuando sea necesario
+    void ClearTextCache() {
+        textSizeCache.clear();
+        bitmapSizeCache.clear();
+        textLayoutCache.clear();
+    }
+    
+    // Clase helper para optimizar SelectObject calls (reduce overhead)
+    class GdiObjectManager {
+        HDC hdc_;
+        HGDIOBJ oldObjects_[10];
+        int count_;
+        
+    public:
+        GdiObjectManager(HDC hdc) : hdc_(hdc), count_(0) {}
+        
+        ~GdiObjectManager() {
+            // Restaurar todos los objetos en orden inverso
+            for (int i = count_ - 1; i >= 0; --i) {
+                SelectObject(hdc_, oldObjects_[i]);
+            }
+        }
+        
+        HGDIOBJ Select(HGDIOBJ obj) {
+            if (count_ < 10) {
+                oldObjects_[count_] = SelectObject(hdc_, obj);
+                count_++;
+                return obj;
+            }
+            return SelectObject(hdc_, obj);
+        }
+        
+        // Método para restaurar manualmente si es necesario
+        void Restore() {
+            for (int i = count_ - 1; i >= 0; --i) {
+                SelectObject(hdc_, oldObjects_[i]);
+            }
+            count_ = 0;
+        }
+    };
+    
+    // Inicializar cache
+    void InitializeCache() {
+        if (!hCachedFontZoom) {
+            hCachedFontZoom = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+        if (!hCachedFont) {
+            hCachedFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+        if (!hCachedFontIndicator) {
+            hCachedFontIndicator = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        }
+        if (!hCachedFontScreenshot) {
+            hCachedFontScreenshot = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                              DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+        
+        if (!hBlackBrush) {
+            hBlackBrush = CreateSolidBrush(RGB(0, 0, 0));
+        }
+        if (!hWhiteBrush) {
+            hWhiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+        }
+        if (!hSelectionBrush) {
+            hSelectionBrush = CreateSolidBrush(RGB(0, 120, 215));
+        }
+        if (!hOverlayBrush) {
+            hOverlayBrush = CreateSolidBrush(RGB(0, 0, 0));
+        }
+        
+        if (!hWhitePen) {
+            hWhitePen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+        }
+        if (!hCursorPen) {
+            hCursorPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+        }
+        if (!hModernPen) {
+            hModernPen = CreatePen(PS_SOLID, 2, RGB(50, 50, 50));
+        }
+    }
+    
+    // Limpiar cache
+    void CleanupCache() {
+        if (hCachedFontZoom) { DeleteObject(hCachedFontZoom); hCachedFontZoom = nullptr; }
+        if (hCachedFont) { DeleteObject(hCachedFont); hCachedFont = nullptr; }
+        if (hCachedFontIndicator) { DeleteObject(hCachedFontIndicator); hCachedFontIndicator = nullptr; }
+        if (hCachedFontScreenshot) { DeleteObject(hCachedFontScreenshot); hCachedFontScreenshot = nullptr; }
+        
+        if (hBlackBrush) { DeleteObject(hBlackBrush); hBlackBrush = nullptr; }
+        if (hWhiteBrush) { DeleteObject(hWhiteBrush); hWhiteBrush = nullptr; }
+        if (hSelectionBrush) { DeleteObject(hSelectionBrush); hSelectionBrush = nullptr; }
+        if (hOverlayBrush) { DeleteObject(hOverlayBrush); hOverlayBrush = nullptr; }
+        
+        if (hWhitePen) { DeleteObject(hWhitePen); hWhitePen = nullptr; }
+        if (hCursorPen) { DeleteObject(hCursorPen); hCursorPen = nullptr; }
+        if (hModernPen) { DeleteObject(hModernPen); hModernPen = nullptr; }
+    }
+}
 
 // Clase RAII para HBITMAP - gestión automática de memoria
 class ScopedBitmap {
@@ -499,6 +712,8 @@ constexpr int MENU_ENABLE_AUTOSTART_ID = 1003;
 constexpr int MENU_DISABLE_AUTOSTART_ID = 1004;
 constexpr int MENU_EXIT_ID = 1005;
 constexpr int MENU_SEPARATOR_ID = 1006;
+constexpr int MENU_LOW_RESOURCES_ID = 1008;
+constexpr int MENU_HIGH_PERFORMANCE_ID = 1009;
 constexpr wchar_t MENU_ACTIVATE_TEXT[] = L"Activate Highlight (Shift+Alt+X)";
 constexpr wchar_t MENU_EXIT_TEXT[] = L"Exit";
 constexpr wchar_t MENU_SEPARATOR_TEXT[] = L"";
@@ -541,6 +756,7 @@ std::atomic<bool> text_selection_active(false);
 // Sistema simple para manejar imágenes del clipboard
 std::vector<ScopedBitmap> clipboard_images;
 std::vector<std::wstring> image_markers; // Marcadores en el texto
+
 // El texto se maneja en una variable global simple (no atómica)
 std::wstring zoom_text;
 // Variable para almacenar el texto antes del zoom (para copiarlo la primera vez)
@@ -555,6 +771,15 @@ std::atomic<int> zoom_max_factor(500); // 5.0x = 500
 std::atomic<int> text_cursor_blink_speed(500); // ms
 std::atomic<int> region_border_thickness(2); // píxeles
 std::atomic<int> region_border_color(0x00FF00); // Verde por defecto
+
+// Modos de recursos
+enum class ResourceMode {
+    Normal = 0,
+    LowResources = 1,
+    HighPerformance = 2
+};
+
+std::atomic<ResourceMode> current_resource_mode(ResourceMode::Normal);
 
 // Variables para scroll vertical de la ventana de configuración
 std::atomic<int> scroll_pos(0);
@@ -652,6 +877,95 @@ struct ScreenRectangle {
 
 std::vector<ScreenRectangle> screenRectangles;
 
+// Declaración forward
+void PreAllocateVectors();
+
+// Aplicar configuraciones según el modo de recursos seleccionado
+void ApplyResourceModeSettings() {
+    ResourceMode mode = current_resource_mode.load();
+    
+    switch (mode) {
+        case ResourceMode::LowResources:
+            printf("🔋 Applying Low Resources Mode settings...\n");
+            
+            // Limpiar caches para liberar memoria
+            GdiCache::ClearTextCache();
+            
+            // Reducir tamaños de pre-allocación
+            clipboard_images.clear();
+            clipboard_images.shrink_to_fit();
+            image_markers.clear();
+            image_markers.shrink_to_fit();
+            drawing_elements.clear();
+            drawing_elements.shrink_to_fit();
+            gif_elements.clear();
+            gif_elements.shrink_to_fit();
+            screenRectangles.clear();
+            screenRectangles.shrink_to_fit();
+            
+            // Pre-allocar con tamaños mínimos
+            clipboard_images.reserve(10);  // Reducido de 50
+            image_markers.reserve(10);     // Reducido de 50
+            drawing_elements.reserve(25);  // Reducido de 100
+            gif_elements.reserve(5);       // Reducido de 20
+            screenRectangles.reserve(5);   // Reducido de 20
+            
+            // Configurar para menor uso de CPU
+            text_cursor_blink_speed.store(750); // Más lento
+            
+            printf("✅ Low Resources Mode applied\n");
+            break;
+            
+        case ResourceMode::HighPerformance:
+            printf("⚡ Applying High Performance Mode settings...\n");
+            
+            // Pre-allocar con tamaños generosos
+            clipboard_images.clear();
+            clipboard_images.shrink_to_fit();
+            image_markers.clear();
+            image_markers.shrink_to_fit();
+            drawing_elements.clear();
+            drawing_elements.shrink_to_fit();
+            gif_elements.clear();
+            gif_elements.shrink_to_fit();
+            screenRectangles.clear();
+            screenRectangles.shrink_to_fit();
+            
+            // Pre-allocar con tamaños máximos para mejor performance
+            clipboard_images.reserve(200);  // Aumentado de 50
+            image_markers.reserve(200);     // Aumentado de 50
+            drawing_elements.reserve(500);  // Aumentado de 100
+            gif_elements.reserve(50);       // Aumentado de 20
+            screenRectangles.reserve(100);  // Aumentado de 20
+            
+            // Configurar para máximo rendimiento
+            text_cursor_blink_speed.store(250); // Más rápido
+            
+            printf("✅ High Performance Mode applied\n");
+            break;
+            
+        case ResourceMode::Normal:
+        default:
+            printf("🔧 Applying Normal Mode settings...\n");
+            
+            // Aplicar configuraciones estándar (las originales)
+            PreAllocateVectors();
+            text_cursor_blink_speed.store(500); // Velocidad normal
+            
+            printf("✅ Normal Mode applied\n");
+            break;
+    }
+}
+
+// Pre-allocar vectores para mejor performance (optimización)
+void PreAllocateVectors() {
+    clipboard_images.reserve(50);  // Pre-allocar para hasta 50 imágenes
+    image_markers.reserve(50);     // Pre-allocar para hasta 50 marcadores
+    drawing_elements.reserve(100); // Pre-allocar para hasta 100 elementos de dibujo
+    gif_elements.reserve(20);      // Pre-allocar para hasta 20 GIFs
+    screenRectangles.reserve(20);  // Pre-allocar para hasta 20 rectángulos
+}
+
 // Variable global para el handle de la ventana overlay
 HWND hCurrentOverlay = NULL;
 
@@ -693,6 +1007,11 @@ void LoadConfiguration() {
                     region_border_color.store(std::stoi(value));
                 } else if (key == "hotkey_shift_alt_x") {
                     hotkey_shift_alt_x.store(std::stoi(value));
+                } else if (key == "resource_mode") {
+                    int mode = std::stoi(value);
+                    if (mode >= 0 && mode <= 2) {
+                        current_resource_mode.store(static_cast<ResourceMode>(mode));
+                    }
                 }
             } catch (const std::exception&) {
                 // Ignorar valores inválidos
@@ -721,6 +1040,7 @@ void SaveConfiguration() {
     file << "region_border_thickness=" << region_border_thickness.load() << std::endl;
     file << "region_border_color=" << region_border_color.load() << std::endl;
     file << "hotkey_shift_alt_x=" << hotkey_shift_alt_x.load() << std::endl;
+    file << "resource_mode=" << static_cast<int>(current_resource_mode.load()) << std::endl;
     
     file.close();
 }
@@ -1446,6 +1766,24 @@ void ShowTrayMenu() {
     AppendMenuW(hMenu, MF_STRING, MENU_ACTIVATE_ID, MENU_ACTIVATE_TEXT);
     AppendMenuW(hMenu, MF_STRING, MENU_SETTINGS_ID, L"⚙️ Settings");
     
+    // Agregar opciones de modo de recursos
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    
+    // Submenu para modos de recursos
+    HMENU hResourceMenu = CreatePopupMenu();
+    
+    // Marcar el modo actual
+    ResourceMode currentMode = current_resource_mode.load();
+    UINT normalFlag = (currentMode == ResourceMode::Normal) ? MF_CHECKED : MF_UNCHECKED;
+    UINT lowFlag = (currentMode == ResourceMode::LowResources) ? MF_CHECKED : MF_UNCHECKED;
+    UINT highFlag = (currentMode == ResourceMode::HighPerformance) ? MF_CHECKED : MF_UNCHECKED;
+    
+    AppendMenuW(hResourceMenu, MF_STRING | normalFlag, 1010, L"🔧 Normal Mode");
+    AppendMenuW(hResourceMenu, MF_STRING | lowFlag, MENU_LOW_RESOURCES_ID, L"🔋 Low Resources Mode");
+    AppendMenuW(hResourceMenu, MF_STRING | highFlag, MENU_HIGH_PERFORMANCE_ID, L"⚡ High Performance Mode");
+    
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hResourceMenu, L"🎯 Resource Mode");
+    
     // Agregar opciones de auto-ejecución
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     if (IsAutoStartEnabled()) {
@@ -1465,17 +1803,17 @@ void ShowTrayMenu() {
     DestroyMenu(hMenu);
 }
 
-// Función para dibujar línea
+// Función para dibujar línea (optimizada)
 void DrawLine(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thickness) {
     ScopedPen hPen(CreatePen(PS_SOLID, thickness, color));
     if (!hPen) return; // Verificar que se creó correctamente
     
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    GdiCache::GdiObjectManager gdiMgr(hdc);
+    gdiMgr.Select(hPen);
     
     MoveToEx(hdc, x1, y1, NULL);
     LineTo(hdc, x2, y2);
     
-    SelectObject(hdc, hOldPen);
     // hPen se limpia automáticamente al salir del scope
 }
 
@@ -1505,12 +1843,10 @@ void DrawArrow(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thic
     DrawLine(hdc, x2, y2, arrowX2, arrowY2, color, thickness);
 }
 
-// Función para dibujar rectángulo
+// Función para dibujar rectángulo (optimizada)
 void DrawRectangle(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thickness, bool filled) {
     ScopedPen hPen(CreatePen(PS_SOLID, thickness, color));
     if (!hPen) return; // Verificar que se creó correctamente
-    
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
     
     // Crear pincel solo si es necesario (filled = true)
     ScopedBrush hBrush;
@@ -1519,12 +1855,12 @@ void DrawRectangle(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int 
         if (!hBrush) return; // Verificar que se creó correctamente
     }
     
-    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, filled ? hBrush : GetStockObject(NULL_BRUSH));
+    GdiCache::GdiObjectManager gdiMgr(hdc);
+    gdiMgr.Select(hPen);
+    gdiMgr.Select(filled ? hBrush : GetStockObject(NULL_BRUSH));
     
     Rectangle(hdc, x1, y1, x2, y2);
     
-    SelectObject(hdc, hOldPen);
-    SelectObject(hdc, hOldBrush);
     // hPen y hBrush se limpian automáticamente al salir del scope
 }
 
@@ -1757,12 +2093,9 @@ void DrawOverlay(HDC hdc, int width, int height) {
     
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
     
-    // Dibujar overlay negro en toda la pantalla
-    ScopedBrush hOverlayBrush(CreateSolidBrush(RGB(0, 0, 0)), true);
-    if (!hOverlayBrush) return; // Verificar que se creó correctamente
-    
+            // Dibujar overlay negro en toda la pantalla (usando cache optimizado)
     RECT fullRect = {0, 0, width, height};
-    FillRect(hMemDC, &fullRect, hOverlayBrush);
+        FillRect(hMemDC, &fullRect, GdiCache::hOverlayBrush);
     
     // Las regiones son completamente transparentes (sin color de overlay)
     if (!screenRectangles.empty() || (selection_mode.load() && start_x.load() != -1)) {
@@ -1824,10 +2157,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         
         // Primero dibujar un fondo blanco sólido para el zoom (brillo normal)
         RECT zoomRect = {zoomX, zoomY, zoomX + zoomedWidth, zoomY + zoomedHeight};
-        ScopedBrush hWhiteBrush(CreateSolidBrush(RGB(255, 255, 255)), true);
-        if (!hWhiteBrush) return; // Verificar que se creó correctamente
-        
-        FillRect(hMemDC, &zoomRect, hWhiteBrush);
+        FillRect(hMemDC, &zoomRect, GdiCache::hWhiteBrush);
         
         // Debug: verificar que el StretchBlt funcione
         // IMPORTANTE: Seleccionar el bitmap antes de hacer StretchBlt
@@ -1848,49 +2178,25 @@ void DrawOverlay(HDC hdc, int width, int height) {
         
         // Dibujar texto debajo de la región con zoom
         if (!zoom_text.empty()) {
-                    // Configurar fuente para el texto (con cache estático para performance)
-        static HFONT hCachedFontZoom = NULL;
-        // static HFONT hOldCachedFontZoom = NULL; // Variable no utilizada
-        if (!hCachedFontZoom) {
-            hCachedFontZoom = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                         DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            // hOldCachedFontZoom = (HFONT)SelectObject(hMemDC, hCachedFontZoom); // Variable no utilizada
-        }
+            // Usar fuente cacheada para mejor performance
+            HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFontZoom);
             
             // Color del texto
             SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco
             SetBkMode(hMemDC, TRANSPARENT); // Fondo transparente
             
             // Calcular tamaño del texto para ajustar el textbox dinámicamente
-            SIZE textSize;
-            GetTextExtentPoint32W(hMemDC, zoom_text.c_str(), zoom_text.length(), &textSize);
+            SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, zoom_text);
             
             // Calcular dimensiones del textbox ajustado al contenido más ancho
             int textBoxWidth = 100; // Ancho mínimo para estabilidad
             
-            // Calcular el ancho máximo de todas las líneas
-            std::wstring widthText = zoom_text;
-            size_t widthPos = 0;
-            size_t widthNewlinePos;
-            while ((widthNewlinePos = widthText.find(L'\n', widthPos)) != std::wstring::npos) {
-                // Calcular ancho de la línea actual
-                std::wstring widthLine = widthText.substr(widthPos, widthNewlinePos - widthPos);
-                if (!widthLine.empty()) {
-                    SIZE widthLineSize;
-                    GetTextExtentPoint32W(hMemDC, widthLine.c_str(), widthLine.length(), &widthLineSize);
+            // Calcular el ancho máximo de todas las líneas (optimizado)
+            std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(zoom_text);
+            for (const auto& line : lines) {
+                if (!line.content.empty()) {
+                    SIZE widthLineSize = GdiCache::GetTextSizeCached(hMemDC, line.content);
                     textBoxWidth = std::max(textBoxWidth, (int)(widthLineSize.cx + 40)); // +40px de padding para seguridad
-                }
-                widthPos = widthNewlinePos + 1;
-            }
-            
-            // Calcular ancho de la última línea (si no termina en \n)
-            if (widthPos < widthText.length()) {
-                std::wstring widthLastLine = widthText.substr(widthPos);
-                if (!widthLastLine.empty()) {
-                    SIZE widthLastLineSize;
-                    GetTextExtentPoint32W(hMemDC, widthLastLine.c_str(), widthLastLine.length(), &widthLastLineSize);
-                    textBoxWidth = std::max(textBoxWidth, (int)(widthLastLineSize.cx + 40)); // +40px de padding para seguridad
                 }
             }
             
@@ -1922,44 +2228,32 @@ void DrawOverlay(HDC hdc, int width, int height) {
             // int currentY = textBoxY + 5; // Variable no utilizada
             // int lineHeight = 20; // Variable no utilizada
             
-                        // Función simple para dibujar texto línea por línea
+                        // Función simple para dibujar texto línea por línea (optimizada)
             auto drawTextSimple = [&](int startY) {
                 if (zoom_text.empty()) return;
                 
-                std::wstring currentText = zoom_text;
+                std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(zoom_text);
                 int currentY = startY;
                 int lineHeight = 20; // Altura de cada línea (se ajusta dinámicamente para imágenes)
                 
-                size_t pos = 0;
-                
-                // Procesar el texto línea por línea
-                while (pos < currentText.length()) {
-                    // Buscar el próximo salto de línea
-                    size_t nextNewline = currentText.find(L'\n', pos);
-                    if (nextNewline == std::wstring::npos) {
-                        nextNewline = currentText.length();
-                    }
-                    
-                    // Obtener la línea actual
-                    std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
-                    
+                for (const auto& line : lines) {
                     // Verificar si la línea contiene un marcador de imagen o GIF
-                    if (currentLine.find(L"[IMAGE_") != std::wstring::npos) {
+                    if (line.content.find(L"[IMAGE_") != std::wstring::npos) {
                         // Extraer el índice de la imagen del marcador
-                        size_t imageStart = currentLine.find(L"[IMAGE_");
-                        size_t imageEnd = currentLine.find(L"]", imageStart);
+                        size_t imageStart = line.content.find(L"[IMAGE_");
+                        size_t imageEnd = line.content.find(L"]", imageStart);
                         if (imageStart != std::wstring::npos && imageEnd != std::wstring::npos) {
-                            std::wstring imageIndexStr = currentLine.substr(imageStart + 7, imageEnd - imageStart - 7);
+                            std::wstring imageIndexStr = line.content.substr(imageStart + 7, imageEnd - imageStart - 7);
                             try {
                                 int imageIndex = std::stoi(imageIndexStr);
                                 if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                    // Dibujar la imagen
+                                    // Dibujar la imagen (usando cache optimizado)
                                     HBITMAP hImage = clipboard_images[imageIndex].get();
-                                    BITMAP bm;
+                                    SIZE imgSize = GdiCache::GetBitmapSizeCached(hImage);
                                     
-                                    if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
-                                        int imgWidth = bm.bmWidth;
-                                        int imgHeight = bm.bmHeight;
+                                    if (imgSize.cx > 0 && imgSize.cy > 0) {
+                                        int imgWidth = imgSize.cx;
+                                        int imgHeight = imgSize.cy;
                                         
                                         // Centrar la imagen horizontalmente
                                         int imgX = textBoxX + (textBoxWidth - imgWidth) / 2;
@@ -1989,21 +2283,21 @@ void DrawOverlay(HDC hdc, int width, int height) {
                             // Si no se puede parsear el marcador, continuar
                             currentY += lineHeight;
                         }
-                    } else if (currentLine.find(L"[GIF_") != std::wstring::npos) {
+                    } else if (line.content.find(L"[GIF_") != std::wstring::npos) {
                         // Extraer el índice del GIF del marcador
-                        size_t gifStart = currentLine.find(L"[GIF_");
-                        size_t gifEnd = currentLine.find(L"]", gifStart);
+                        size_t gifStart = line.content.find(L"[GIF_");
+                        size_t gifEnd = line.content.find(L"]", gifStart);
                         if (gifStart != std::wstring::npos && gifEnd != std::wstring::npos) {
-                            std::wstring gifIndexStr = currentLine.substr(gifStart + 5, gifEnd - gifStart - 5);
+                            std::wstring gifIndexStr = line.content.substr(gifStart + 5, gifEnd - gifStart - 5);
                             try {
                                 int gifIndex = std::stoi(gifIndexStr);
                                 if (gifIndex >= 0 && gifIndex < static_cast<int>(gif_elements.size()) && !gif_elements[gifIndex].frames.empty()) {
-                                    // Dibujar el frame actual del GIF
+                                    // Dibujar el frame actual del GIF (usando cache optimizado)
                                     const GifElement& gif = gif_elements[gifIndex];
                                     HBITMAP hGifFrame = gif.frames[gif.current_frame].get();
-                                    BITMAP bm;
+                                    SIZE gifSize = GdiCache::GetBitmapSizeCached(hGifFrame);
                                     
-                                    if (GetObject(hGifFrame, sizeof(BITMAP), &bm) > 0) {
+                                    if (gifSize.cx > 0 && gifSize.cy > 0) {
                                         int gifWidth = gif.width;
                                         int gifHeight = gif.height;
                                         
@@ -2035,7 +2329,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                             // Si no se puede parsear el marcador, continuar
                             currentY += lineHeight;
                         }
-                    } else if (!currentLine.empty()) {
+                    } else if (!line.content.empty()) {
                         // Calcular si esta línea tiene texto seleccionado
                         bool hasSelection = false;
                         int selectionStart = -1;
@@ -2046,14 +2340,14 @@ void DrawOverlay(HDC hdc, int width, int height) {
                             int end = std::max(text_selection_start.load(), text_selection_end.load());
                             
                             // Verificar si esta línea tiene caracteres específicos seleccionados
-                            int lineStart = (int)pos;
-                            int lineEnd = (int)(pos + currentLine.length());
+                            int lineStart = (int)line.startPos;
+                            int lineEnd = (int)line.endPos;
                             
                             // Solo seleccionar si hay superposición real
                             if (start < lineEnd && end > lineStart) {
                                 hasSelection = true;
                                 selectionStart = std::max(0, start - lineStart);
-                                selectionEnd = std::min((int)currentLine.length(), end - lineStart);
+                                selectionEnd = std::min((int)line.content.length(), end - lineStart);
                                 
                                 // Solo seleccionar si hay caracteres realmente seleccionados
                                 if (selectionStart >= selectionEnd) {
@@ -2066,19 +2360,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
                             // Dibujar texto con selección parcial
                             // Primero dibujar el texto normal
                             RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                            DrawTextW(hMemDC, currentLine.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
+                            DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
                             
                             // Ahora dibujar el fondo de selección solo para los caracteres seleccionados
-                            if (selectionStart < (int)currentLine.length()) {
+                            if (selectionStart < (int)line.content.length()) {
                                 // Calcular posición X del inicio de la selección
-                                std::wstring textBeforeSelection = currentLine.substr(0, selectionStart);
-                                SIZE textBeforeSize;
-                                GetTextExtentPoint32W(hMemDC, textBeforeSelection.c_str(), textBeforeSelection.length(), &textBeforeSize);
+                                std::wstring textBeforeSelection = line.content.substr(0, selectionStart);
+                                SIZE textBeforeSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeSelection);
                                 
                                 // Calcular posición X del final de la selección
-                                std::wstring textInSelection = currentLine.substr(selectionStart, selectionEnd - selectionStart);
-                                SIZE textInSelectionSize;
-                                GetTextExtentPoint32W(hMemDC, textInSelection.c_str(), textInSelection.length(), &textInSelectionSize);
+                                std::wstring textInSelection = line.content.substr(selectionStart, selectionEnd - selectionStart);
+                                SIZE textInSelectionSize = GdiCache::GetTextSizeCached(hMemDC, textInSelection);
                                 
                                 // Dibujar fondo azul solo para los caracteres seleccionados
                                 RECT selectionRect = {
@@ -2088,9 +2380,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                     currentY + lineHeight
                                 };
                                 
-                                HBRUSH hSelectionBrush = CreateSolidBrush(RGB(0, 120, 215)); // Azul de selección estándar de Windows
-                                FillRect(hMemDC, &selectionRect, hSelectionBrush);
-                                DeleteObject(hSelectionBrush);
+                                FillRect(hMemDC, &selectionRect, GdiCache::hSelectionBrush);
                                 
                                 // Redibujar solo el texto seleccionado en blanco sobre el fondo azul
                                 SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco sobre fondo azul
@@ -2108,7 +2398,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                         } else {
                             // Dibujar texto normal sin selección
                             RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                            DrawTextW(hMemDC, currentLine.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
+                            DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
                                         }
                         
                         currentY += lineHeight; // Línea de texto normal
@@ -2116,17 +2406,12 @@ void DrawOverlay(HDC hdc, int width, int height) {
                         // Línea vacía - usar altura estándar para el texto
                         currentY += lineHeight; // Altura estándar para línea vacía
                             }
-                            
-                            // Mover a la siguiente línea
-                            pos = nextNewline + 1;
                         }
             };
             
             // Dibujar texto simple línea por línea (ahora incluye el renderizado de imágenes mediante marcadores)
             drawTextSimple(textBoxY + 5);
             // Las imágenes se renderizan automáticamente mediante los marcadores [IMAGE_X] en drawTextSimple
-            
-
             
             // CURSOR SIMPLE - Aparece al final del texto como una línea vertical
             if (text_input_mode.load() && text_cursor_visible.load()) {
@@ -2203,8 +2488,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                             } else {
                                 // Esta línea es texto normal
                                 std::wstring textBeforeCursor = currentLine.substr(0, targetPos - pos);
-                                SIZE textSize;
-                                GetTextExtentPoint32W(hMemDC, textBeforeCursor.c_str(), textBeforeCursor.length(), &textSize);
+                        SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeCursor);
                                 cursorX = textBoxX + 10 + (int)textSize.cx;
                                 cursorY = currentY;
                             }
@@ -2225,7 +2509,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                             BITMAP bm;
                                             if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
                                                 // IMPORTANTE: Actualizar currentY con la altura real de la imagen
-                                                currentY += bm.bmHeight + 5;
+                                            currentY += 50 + 5; // Altura fija temporal para imágenes
                                             } else {
                                                 currentY += lineHeight; // Fallback si no se puede obtener altura
                                             }
@@ -2269,13 +2553,11 @@ void DrawOverlay(HDC hdc, int width, int height) {
                     }
                 }
                 
-                // Dibujar cursor vertical simple en la posición correcta
-                HPEN hCursorPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-                HPEN hOldPen = (HPEN)SelectObject(hMemDC, hCursorPen);
+                // Dibujar cursor vertical simple en la posición correcta (usando cache optimizado)
+                HPEN hOldPen = (HPEN)SelectObject(hMemDC, GdiCache::hCursorPen);
                 MoveToEx(hMemDC, cursorX, cursorY, NULL);
                 LineTo(hMemDC, cursorX, cursorY + 20); // Altura fija de 20px por línea
                 SelectObject(hMemDC, hOldPen);
-                DeleteObject(hCursorPen);
             }
             
             // Restaurar fuente (no es necesario con cache estático)
@@ -2286,49 +2568,25 @@ void DrawOverlay(HDC hdc, int width, int height) {
     
     // Dibujar texto cuando no hay zoom pero sí está en modo texto
     if (!zoom_active.load() && text_input_mode.load() && !zoom_text.empty()) {
-        // Configurar fuente para el texto (con cache estático para performance)
-        static HFONT hCachedFont = NULL;
-        // static HFONT hOldCachedFont = NULL; // Variable no utilizada
-        if (!hCachedFont) {
-            hCachedFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                     DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            // hOldCachedFont = (HFONT)SelectObject(hMemDC, hCachedFont); // Variable no utilizada
-        }
+        // Usar fuente cacheada para mejor performance
+        HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFont);
         
         // Color del texto
         SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco
         SetBkMode(hMemDC, TRANSPARENT); // Fondo transparente
         
         // Calcular tamaño del texto para ajustar el textbox dinámicamente
-        SIZE textSize;
-        GetTextExtentPoint32W(hMemDC, zoom_text.c_str(), zoom_text.length(), &textSize);
+        SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, zoom_text);
         
         // Calcular dimensiones del textbox ajustado al contenido más ancho
         int textBoxWidth = 100; // Ancho mínimo para estabilidad
         
-        // Calcular el ancho máximo de todas las líneas
-        std::wstring widthText = zoom_text;
-        size_t widthPos = 0;
-        size_t widthNewlinePos;
-        while ((widthNewlinePos = widthText.find(L'\n', widthPos)) != std::string::npos) {
-            // Calcular ancho de la línea actual
-            std::wstring widthLine = widthText.substr(widthPos, widthNewlinePos - widthPos);
-            if (!widthLine.empty()) {
-                SIZE widthLineSize;
-                GetTextExtentPoint32W(hMemDC, widthLine.c_str(), widthLine.length(), &widthLineSize);
+        // Calcular el ancho máximo de todas las líneas (optimizado)
+        std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(zoom_text);
+        for (const auto& line : lines) {
+            if (!line.content.empty()) {
+                SIZE widthLineSize = GdiCache::GetTextSizeCached(hMemDC, line.content);
                 textBoxWidth = std::max(textBoxWidth, (int)(widthLineSize.cx + 40)); // +40px de padding para seguridad
-            }
-            widthPos = widthNewlinePos + 1;
-        }
-        
-        // Calcular ancho de la última línea (si no termina en \n)
-        if (widthPos < widthText.length()) {
-            std::wstring widthLastLine = widthText.substr(widthPos);
-            if (!widthLastLine.empty()) {
-                SIZE widthLastLineSize;
-                GetTextExtentPoint32W(hMemDC, widthLastLine.c_str(), widthLastLine.length(), &widthLastLineSize);
-                textBoxWidth = std::max(textBoxWidth, (int)(widthLastLineSize.cx + 40)); // +40px de padding para seguridad
             }
         }
         
@@ -2364,22 +2622,12 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Posición del texto (centrado en el textbox ajustado)
         // RECT textRect = {textBoxX + 10, textBoxY + 5, textBoxX + textBoxWidth - 10, textBoxY + textBoxHeight - 5}; // Variable no utilizada
         
-        // Dibujar texto línea por línea
-        std::wstring currentText = zoom_text;
+        // Dibujar texto línea por línea (optimizado) - usando variable existente
+        // lines ya está declarada arriba
         int currentY = textBoxY + 5;
         int lineHeight = 20; // Altura de cada línea
         
-        size_t pos = 0;
-        while (pos < currentText.length()) {
-            // Buscar el próximo salto de línea
-            size_t nextNewline = currentText.find(L'\n', pos);
-            if (nextNewline == std::string::npos) {
-                nextNewline = currentText.length();
-            }
-            
-            // Obtener la línea actual
-            std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
-            
+        for (const auto& line : lines) {
             // Calcular si esta línea tiene texto seleccionado
             bool hasSelection = false;
             int selectionStart = -1;
@@ -2390,14 +2638,14 @@ void DrawOverlay(HDC hdc, int width, int height) {
                 int end = std::max(text_selection_start.load(), text_selection_end.load());
                 
                 // Verificar si esta línea tiene caracteres específicos seleccionados
-                int lineStart = (int)pos;
-                int lineEnd = (int)(pos + currentLine.length());
+                int lineStart = (int)line.startPos;
+                int lineEnd = (int)line.endPos;
                 
                 // Solo seleccionar si hay superposición real
                 if (start < lineEnd && end > lineStart) {
                     hasSelection = true;
                     selectionStart = std::max(0, start - lineStart);
-                    selectionEnd = std::min((int)currentLine.length(), end - lineStart);
+                    selectionEnd = std::min((int)line.content.length(), end - lineStart);
                     
                     // Solo seleccionar si hay caracteres realmente seleccionados
                     if (selectionStart >= selectionEnd) {
@@ -2410,19 +2658,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
                 // Dibujar texto con selección parcial
                 // Primero dibujar el texto normal
                 RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                DrawTextW(hMemDC, currentLine.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
+                DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
                 
                 // Ahora dibujar el fondo de selección solo para los caracteres seleccionados
-                if (selectionStart < (int)currentLine.length()) {
+                if (selectionStart < (int)line.content.length()) {
                     // Calcular posición X del inicio de la selección
-                    std::wstring textBeforeSelection = currentLine.substr(0, selectionStart);
-                    SIZE textBeforeSize;
-                    GetTextExtentPoint32W(hMemDC, textBeforeSelection.c_str(), textBeforeSelection.length(), &textBeforeSize);
+                    std::wstring textBeforeSelection = line.content.substr(0, selectionStart);
+                    SIZE textBeforeSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeSelection);
                     
                     // Calcular posición X del final de la selección
-                    std::wstring textInSelection = currentLine.substr(selectionStart, selectionEnd - selectionStart);
-                    SIZE textInSelectionSize;
-                    GetTextExtentPoint32W(hMemDC, textInSelection.c_str(), textInSelection.length(), &textInSelectionSize);
+                    std::wstring textInSelection = line.content.substr(selectionStart, selectionEnd - selectionStart);
+                    SIZE textInSelectionSize = GdiCache::GetTextSizeCached(hMemDC, textInSelection);
                     
                     // Dibujar fondo azul solo para los caracteres seleccionados
                     RECT selectionRect = {
@@ -2432,9 +2678,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                         currentY + lineHeight
                     };
                     
-                    HBRUSH hSelectionBrush = CreateSolidBrush(RGB(0, 120, 215)); // Azul de selección estándar de Windows
-                    FillRect(hMemDC, &selectionRect, hSelectionBrush);
-                    DeleteObject(hSelectionBrush);
+                    FillRect(hMemDC, &selectionRect, GdiCache::hSelectionBrush);
                     
                     // Redibujar solo el texto seleccionado en blanco sobre el fondo azul
                     SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco sobre fondo azul
@@ -2452,11 +2696,9 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                 } else {
                 // Dibujar texto normal sin selección
                 RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                DrawTextW(hMemDC, currentLine.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
+                DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
                 }
                 
-                // Mover a la siguiente línea
-                pos = nextNewline + 1;
             currentY += lineHeight;
         }
         
@@ -2502,10 +2744,10 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                     int imageIndex = std::stoi(imageIndexStr);
                                     if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
                                         HBITMAP hImage = clipboard_images[imageIndex].get();
-                                        BITMAP bm;
-                                        if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
+                                        SIZE imgSize = GdiCache::GetBitmapSizeCached(hImage);
+                                        if (imgSize.cx > 0 && imgSize.cy > 0) {
                                             // El cursor debe estar después de la imagen
-                                            cursorY = currentY + bm.bmHeight + 5;
+                                            cursorY = currentY + imgSize.cy + 5;
                                             cursorX = textBoxX + 10; // Al inicio de la siguiente línea
                                         }
                                     }
@@ -2517,8 +2759,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
                         } else {
                             // Esta línea es texto normal
                             std::wstring textBeforeCursor = currentLine.substr(0, targetPos - pos);
-                            SIZE textSize;
-                            GetTextExtentPoint32W(hMemDC, textBeforeCursor.c_str(), textBeforeCursor.length(), &textSize);
+                            SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeCursor);
                             cursorX = textBoxX + 10 + (int)textSize.cx;
                             cursorY = currentY;
                         }
@@ -2536,10 +2777,10 @@ void DrawOverlay(HDC hdc, int width, int height) {
                                     int imageIndex = std::stoi(imageIndexStr);
                                     if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
                                         HBITMAP hImage = clipboard_images[imageIndex].get();
-                                        BITMAP bm;
-                                        if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
+                                        SIZE imgSize = GdiCache::GetBitmapSizeCached(hImage);
+                                        if (imgSize.cx > 0 && imgSize.cy > 0) {
                                             // El cursor debe estar después de la imagen
-                                            cursorY = currentY + bm.bmHeight + 5;
+                                            cursorY = currentY + imgSize.cy + 5;
                                             cursorX = textBoxX + 10; // Al inicio de la siguiente línea
                                         }
                                     }
@@ -2561,21 +2802,17 @@ void DrawOverlay(HDC hdc, int width, int height) {
                 }
             }
             
-            // Dibujar cursor vertical simple en la posición correcta
-            HPEN hCursorPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-            HPEN hOldPen = (HPEN)SelectObject(hMemDC, hCursorPen);
+            // Dibujar cursor vertical simple en la posición correcta (usando cache optimizado)
+            HPEN hOldPen = (HPEN)SelectObject(hMemDC, GdiCache::hCursorPen);
             MoveToEx(hMemDC, cursorX, cursorY, NULL);
             LineTo(hMemDC, cursorX, cursorY + 20); // Altura fija de 20px por línea
             SelectObject(hMemDC, hOldPen);
-            DeleteObject(hCursorPen);
         }
         
         // Restaurar fuente (no es necesario con cache estático)
         // SelectObject(hMemDC, hOldCachedFont);
         // DeleteObject(hCachedFont);
     }
-    
-    DeleteObject(hOverlayBrush);
     
     // Dibujar bordes verdes (solo si hay regiones)
     if (!screenRectangles.empty() || (selection_mode.load() && start_x.load() != -1)) {
@@ -2630,11 +2867,8 @@ void DrawOverlay(HDC hdc, int width, int height) {
     
     // Mostrar indicador de herramienta activa
     if (drawing_active.load()) {
-        // Crear fuente para el indicador
-        HFONT hIndicatorFont = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        HFONT hOldFont = (HFONT)SelectObject(hMemDC, hIndicatorFont);
+        // Usar fuente cacheada para mejor performance
+        HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFontIndicator);
         
         // Texto del indicador
         std::wstring toolText;
@@ -2648,9 +2882,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         
         // Fondo del indicador
         RECT indicatorRect = {20, 20, 200, 50};
-        HBRUSH hIndicatorBrush = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(hMemDC, &indicatorRect, hIndicatorBrush);
-        DeleteObject(hIndicatorBrush);
+        FillRect(hMemDC, &indicatorRect, GdiCache::hBlackBrush);
         
         // Borde del indicador
         HPEN hIndicatorPen = CreatePen(PS_SOLID, 2, drawing_color.load());
@@ -2668,17 +2900,14 @@ void DrawOverlay(HDC hdc, int width, int height) {
         SelectObject(hMemDC, hOldFont);
         SelectObject(hMemDC, hOldPen);
         SelectObject(hMemDC, hOldBrush);
-        DeleteObject(hIndicatorFont);
+        // DeleteObject(hIndicatorFont); // Comentado - usando cache estático
         DeleteObject(hIndicatorPen);
     }
     
     // Mostrar indicador del modo captura
     if (screenshot_mode.load()) {
-        // Crear fuente para el indicador
-        HFONT hIndicatorFont = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        HFONT hOldFont = (HFONT)SelectObject(hMemDC, hIndicatorFont);
+        // Usar fuente cacheada para mejor performance
+        HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFontIndicator);
         
         // Texto del indicador de captura
         std::wstring toolText = L"📸 SCREENSHOT";
@@ -2705,7 +2934,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         SelectObject(hMemDC, hOldFont);
         SelectObject(hMemDC, hOldPen);
         SelectObject(hMemDC, hOldBrush);
-        DeleteObject(hIndicatorFont);
+        // DeleteObject(hIndicatorFont); // Comentado - usando cache estático
         DeleteObject(hIndicatorPen);
         
         // Mostrar instrucciones
@@ -2753,10 +2982,7 @@ void DrawOverlay(HDC hdc, int width, int height) {
         DeleteObject(hDashedPen);
         
         // Mostrar texto indicativo
-        HFONT hFont = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                 DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT hOldFont = (HFONT)SelectObject(hMemDC, hFont);
+        HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFontScreenshot);
         
         SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco para mejor visibilidad
         SetBkMode(hMemDC, TRANSPARENT);
@@ -2766,7 +2992,6 @@ void DrawOverlay(HDC hdc, int width, int height) {
         DrawTextW(hMemDC, captionText.c_str(), -1, &captionRect, DT_CENTER | DT_VCENTER);
         
         SelectObject(hMemDC, hOldFont);
-        DeleteObject(hFont);
     }
     
     // Dibujar preview de dibujo en tiempo real (funciona también durante el zoom)
@@ -2863,12 +3088,9 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
     
-    // Fondo negro puro (sin transparencia)
-    ScopedBrush hBlackBrush(CreateSolidBrush(RGB(0, 0, 0)), true);
-    if (!hBlackBrush) return; // Verificar que se creó correctamente
-    
+    // Fondo negro puro (sin transparencia) - usando cache optimizado
     RECT fullRect = {0, 0, width, height};
-    FillRect(hMemDC, &fullRect, hBlackBrush);
+    FillRect(hMemDC, &fullRect, GdiCache::hBlackBrush);
     
     // Crear fuentes modernas
     ScopedFont hTitleFont(CreateFontW(32, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -2905,11 +3127,8 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     RECT subtitleRect = {40, headerY + 45, width - 40, headerY + 70};
     DrawTextW(hMemDC, L"Screen Highlighter Pro", -1, &subtitleRect, DT_CENTER | DT_TOP);
     
-    // Línea separadora moderna
-    ScopedPen hModernPen(CreatePen(PS_SOLID, 2, RGB(50, 50, 50)));
-    if (!hModernPen) return; // Verificar que se creó correctamente
-    
-    HPEN hOldPen = (HPEN)SelectObject(hMemDC, hModernPen);
+    // Línea separadora moderna (usando cache optimizado)
+    HPEN hOldPen = (HPEN)SelectObject(hMemDC, GdiCache::hModernPen);
     MoveToEx(hMemDC, 60, headerY + 85, NULL);
     LineTo(hMemDC, width - 60, headerY + 85);
     
@@ -5192,6 +5411,48 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                         MB_OK | MB_ICONINFORMATION);
                     break;
                     
+                case 1010: // Normal Mode
+                    current_resource_mode.store(ResourceMode::Normal);
+                    ApplyResourceModeSettings();
+                    SaveConfiguration();
+                    MessageBoxW(hMainWnd, 
+                        L"Normal Mode activated.\n\n"
+                        L"Standard resource usage and performance settings applied.",
+                        L"Resource Mode", 
+                        MB_OK | MB_ICONINFORMATION);
+                    break;
+                    
+                case MENU_LOW_RESOURCES_ID: // Low Resources Mode
+                    current_resource_mode.store(ResourceMode::LowResources);
+                    ApplyResourceModeSettings();
+                    SaveConfiguration();
+                    MessageBoxW(hMainWnd, 
+                        L"Low Resources Mode activated.\n\n"
+                        L"Optimized for minimal CPU, memory and resource usage.\n"
+                        L"• Reduced cache sizes\n"
+                        L"• Lower refresh rates\n"
+                        L"• Simplified rendering\n"
+                        L"• Memory optimizations",
+                        L"Low Resources Mode", 
+                        MB_OK | MB_ICONINFORMATION);
+                    break;
+                    
+                case MENU_HIGH_PERFORMANCE_ID: // High Performance Mode
+                    current_resource_mode.store(ResourceMode::HighPerformance);
+                    ApplyResourceModeSettings();
+                    SaveConfiguration();
+                    MessageBoxW(hMainWnd, 
+                        L"High Performance Mode activated.\n\n"
+                        L"Maximum performance and responsiveness.\n"
+                        L"• Pre-allocated memory pools\n"
+                        L"• Larger cache sizes\n"
+                        L"• Higher refresh rates\n"
+                        L"• Advanced optimizations\n"
+                        L"• Priority resource allocation",
+                        L"High Performance Mode", 
+                        MB_OK | MB_ICONINFORMATION);
+                    break;
+                    
                 case MENU_EXIT_ID: // Salir
                     running.store(false);
                     PostQuitMessage(0);
@@ -5362,6 +5623,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Cargar configuración desde archivo .ini al inicio
     LoadConfiguration();
     printf("✅ Configuration loaded\n");
+    
+    // Aplicar configuraciones del modo de recursos
+    printf("🎯 Aplicando configuraciones del modo de recursos...\n");
+    ApplyResourceModeSettings();
+    
+    // Inicializar cache de recursos GDI para optimización de performance
+    printf("🔧 Inicializando cache de recursos GDI...\n");
+    GdiCache::InitializeCache();
+    printf("✅ Cache de recursos GDI inicializado\n");
+    
+    // Pre-allocar vectores para mejor performance
+    printf("🔧 Pre-allocando vectores...\n");
+    PreAllocateVectors();
+    printf("✅ Vectores pre-allocados\n");
                 
     // Crear una ventana oculta para manejar mensajes
     WNDCLASSEXW wc = {};
@@ -5486,6 +5761,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Remover del system tray
     RemoveFromSystemTray();
+    
+    // Limpiar cache de recursos GDI
+    printf("🧹 Limpiando cache de recursos GDI...\n");
+    GdiCache::CleanupCache();
+    printf("✅ Cache de recursos GDI limpiado\n");
     
     return 0;
 }

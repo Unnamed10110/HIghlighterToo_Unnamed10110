@@ -57,45 +57,46 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 
 ### **For Daily Use (RECOMMENDED)**
 ```cmd
-build_debug_silent.bat
+build.bat
 ```
 - ✅ **Complete debug functionality**
 - ✅ **No console window**
 - ✅ **Hotkeys work perfectly**
 - ✅ **System tray works correctly**
+- ✅ **Executable created in root directory**
 
 ### **For Advanced Options**
 ```cmd
-build_advanced.bat
+build.bat
 ```
-- **5 compilation options**
-- **Total flexibility** for different needs
+- **Single compilation option**
+- **Executable in root directory**
+- **Clean build process**
 
 ## 🔧 **Complete Build System**
 
 ### **Available Scripts**
 
-#### **1. `build_debug_silent.bat` - RECOMMENDED for daily use**
+#### **1. `build.bat` - RECOMMENDED for all use**
 - **Functionality**: Complete debug without console
 - **Advantages**: Hotkeys and system tray work perfectly
-- **Use**: Daily development, personal use
+- **Output**: Executable created in root directory
+- **Use**: Daily development, personal use, production
 
-#### **2. `build_advanced.bat` - Advanced build with 5 options**
-- **Option 1**: Release (no console) - ⚠️ **Known issues**
-- **Option 2**: Debug (with console) - ✅ **Works perfectly**
-- **Option 3**: Release + console - ✅ **Works perfectly**
-- **Option 4**: Silent debug - ✅ **Works perfectly**
-- **Option 5**: Compile only (no execution)
+#### **2. `clean.bat` - Clean build files**
+- **Functionality**: Removes build directory and temporary files
+- **Use**: Clean up after compilation
 
 ### **Detailed Compilation Modes**
 
 #### **🔇 Silent Debug Mode (RECOMMENDED)**
-- **Script**: `build_debug_silent.bat`
+- **Script**: `build.bat`
 - **Optimization**: Minimal (`-O0`)
 - **Debug**: Complete information (`-g`)
 - **Console**: Not visible
 - **Functionality**: ✅ **Hotkeys and system tray work perfectly**
-- **Use**: Daily development, personal use
+- **Output**: ✅ **Executable in root directory**
+- **Use**: Daily development, personal use, production
 
 #### **🐛 Debug Mode (With Console)**
 - **Script**: `build_advanced.bat` (option 2)
@@ -202,16 +203,18 @@ build_advanced.bat
 ```
 ScreenHighlighter/
 ├── main.cpp                    # Main source code (5494 lines)
-├── CMakeLists.txt             # Optimized CMake configuration
-├── build_debug_silent.bat     # Main compilation script
-├── build_advanced.bat         # Advanced build script
+├── CMakeLists.txt             # CMake configuration
+├── build.bat                  # Main compilation script
+├── clean.bat                  # Clean build files script
 ├── config/                    # Project configuration
 │   ├── CMakeConfig.cmake      # Default values
 │   └── ScreenHighlighter.ini.in # Configuration template
 ├── resources.rc               # Windows resource file (icon + version info)
-├── README.md                  # This file (unified documentation)
-├── .gitignore                 # Optimized Git ignore
-└── misc01.ico                 # Application icon
+├── README.md                  # This file
+├── .gitignore                 # Git ignore file
+├── misc01.ico                 # Application icon
+├── ScreenHighlighter.exe      # Compiled executable (in root)
+└── ScreenHighlighter.ini      # Generated configuration file
 ```
 
 ## 🔍 **Available CMake Variables**
@@ -367,18 +370,17 @@ build_advanced.bat
 ## 🎯 **Usage Recommendations**
 
 ### **For Developers**
-1. **Daily development**: `build_debug_silent.bat` (recommended)
-2. **Detailed debugging**: `build_advanced.bat` (option 2)
-3. **Final testing**: `build_advanced.bat` (option 3)
-4. **Release**: `build_advanced.bat` (option 1) - ⚠️ **Known issues**
+1. **Daily development**: `build.bat` (recommended)
+2. **Clean up**: `clean.bat` after compilation
+3. **Executable**: `ScreenHighlighter.exe` in root directory
 
 ### **For End Users**
-1. **Normal use**: `build_debug_silent.bat` (silent debug mode)
-2. **Report bugs**: `build_advanced.bat` (option 2)
+1. **Normal use**: `build.bat` (silent debug mode)
+2. **Executable**: `ScreenHighlighter.exe` in root directory
 
 ### **For QA/Testing**
-1. **Functional testing**: `build_debug_silent.bat`
-2. **Performance testing**: `build_advanced.bat` (option 3)
+1. **Functional testing**: `build.bat`
+2. **Executable**: `ScreenHighlighter.exe` in root directory
 
 ## 🎉 **Project Achievements**
 

@@ -110,9 +110,9 @@ if(WIN32)
     target_link_libraries(${PROJECT_NAME} ${WINDOWS_LIBRARIES})
 endif()
 
-# Configurar directorio de salida
+# Configurar directorio de salida - compilar directamente en la raíz
 set_target_properties(${PROJECT_NAME} PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
 # Configurar instalación
@@ -120,10 +120,10 @@ install(TARGETS ${PROJECT_NAME}
     RUNTIME DESTINATION bin
 )
 
-# Configurar archivos de configuración
+# Configurar archivos de configuración - copiar a la raíz
 configure_file(
     "${CMAKE_SOURCE_DIR}/config/ScreenHighlighter.ini.in"
-    "${CMAKE_BINARY_DIR}/bin/ScreenHighlighter.ini"
+    "${CMAKE_SOURCE_DIR}/ScreenHighlighter.ini"
     @ONLY
 )
 
@@ -134,11 +134,11 @@ configure_file(
     @ONLY
 )
 
-# Configurar archivos de recursos
+# Configurar archivos de recursos - copiar a la raíz
 if(EXISTS "${CMAKE_SOURCE_DIR}/misc01.ico")
     configure_file(
         "${CMAKE_SOURCE_DIR}/misc01.ico"
-        "${CMAKE_BINARY_DIR}/bin/misc01.ico"
+        "${CMAKE_SOURCE_DIR}/misc01.ico"
         COPYONLY
     )
 endif()
@@ -156,4 +156,4 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Debug mode: ${DEBUG_MODE}")
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "C++ Extensions: ${CMAKE_CXX_EXTENSIONS}")
-message(STATUS "Output directory: ${CMAKE_BINARY_DIR}/bin")
+message(STATUS "Output directory: ${CMAKE_SOURCE_DIR}")
