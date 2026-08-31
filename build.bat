@@ -31,7 +31,7 @@ echo ========================================
 echo    COMPILACIÓN EXITOSA!
 echo ========================================
 echo.
-echo Ejecutable creado en: ScreenHighlighter.exe
+echo Ejecutable creado en: release\ScreenHighlighter.exe
 echo.
 echo CARACTERÍSTICAS:
 echo ✅ Funcionalidad debug completa
@@ -51,10 +51,10 @@ if /i "%choice%"=="S" (
     echo 💡 Presiona Shift+Alt+X para activar el highlight
     echo 💡 Busca el icono en el system tray
     echo.
-    ..\ScreenHighlighter.exe
+    ..\release\ScreenHighlighter.exe
 ) else (
     echo.
-    echo ✅ Compilación completada. Ejecuta ScreenHighlighter.exe cuando quieras.
+    echo ✅ Compilación completada. Ejecuta release\ScreenHighlighter.exe cuando quieras.
 )
 
 pause
