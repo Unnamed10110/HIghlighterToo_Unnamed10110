@@ -117,21 +117,19 @@ if(WIN32)
     target_link_libraries(${PROJECT_NAME} ${WINDOWS_LIBRARIES})
 endif()
 
-# Configurar directorio de salida: release/ en la raíz del proyecto.
-set(SH_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/release")
-
+# Configurar directorio de salida - compilar directamente en la raíz
 set_target_properties(${PROJECT_NAME} PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${SH_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
 # Los generadores multi-configuración (Visual Studio, Ninja Multi-Config) agregan
-# el nombre de la configuración a RUNTIME_OUTPUT_DIRECTORY, lo que daría
-# release/Release/ y release/Debug/. Las propiedades por configuración NO reciben
-# ese sufijo, así que fijándolas todas el ejecutable queda siempre en release/,
-# sin importar el generador ni el tipo de build.
+# el nombre de la configuración a RUNTIME_OUTPUT_DIRECTORY, con lo que el .exe
+# terminaba en Release/ o Debug/ en vez de la raíz. Las propiedades por
+# configuración NO reciben ese sufijo, así que fijándolas todas el ejecutable
+# queda en la raíz con cualquier generador, no solo con MinGW Makefiles.
 foreach(SH_CFG DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     set_target_properties(${PROJECT_NAME} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY_${SH_CFG} "${SH_OUTPUT_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_${SH_CFG} "${CMAKE_SOURCE_DIR}"
     )
 endforeach()
 
@@ -145,14 +143,12 @@ install(TARGETS ${PROJECT_NAME}
 # "overlay_opacity=" que la aplicacion no podia interpretar.
 include("${CMAKE_SOURCE_DIR}/config/CMakeConfig.cmake")
 
-# El .ini con los valores por defecto se genera junto al ejecutable, en release/,
-# para que el binario y su configuración inicial queden como un conjunto
-# distribuible. La aplicación en ejecución usa
-# %APPDATA%\ScreenHighlighter\ScreenHighlighter.ini y, en el primer arranque,
-# migra el .ini que encuentre junto al ejecutable.
+# Configurar archivos de configuración - copiar a la raíz.
+# La aplicación en ejecución usa %APPDATA%\ScreenHighlighter\ScreenHighlighter.ini
+# y, en el primer arranque, migra el .ini que encuentre junto al ejecutable.
 configure_file(
     "${CMAKE_SOURCE_DIR}/config/ScreenHighlighter.ini.in"
-    "${SH_OUTPUT_DIR}/ScreenHighlighter.ini"
+    "${CMAKE_SOURCE_DIR}/ScreenHighlighter.ini"
     @ONLY
 )
 
