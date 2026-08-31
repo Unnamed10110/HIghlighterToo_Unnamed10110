@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ScreenHighlighter VERSION 1.0.0 LANGUAGES CXX)
+project(ScreenHighlighter VERSION 2.0.0 LANGUAGES CXX)
 
 # Configurar estándar C++
 set(CMAKE_CXX_STANDARD 23)
@@ -17,6 +17,10 @@ option(SILENT_DEBUG "Modo debug silencioso (sin consola, con debug)" OFF)
 if(WIN32)
     # Configurar para aplicación Win32 sin consola
     set(CMAKE_WIN32_EXECUTABLE TRUE)
+
+    # windows.h define macros min/max que rompen std::min / std::max.
+    # NOMINMAX las desactiva (obligatorio para compilar con MSVC).
+    add_compile_definitions(NOMINMAX)
     
     # Configurar flags de compilación específicos para el compilador
     if(MSVC)
@@ -59,6 +63,7 @@ if(WIN32)
         gdiplus
         shlwapi
         windowscodecs
+        msimg32          # AlphaBlend (resaltador translucido)
     )
 endif()
 
@@ -79,6 +84,13 @@ if(WIN32)
     )
 endif()
 
+# El compilador de recursos debe encontrar admin_manifest.manifest, que se genera
+# tanto en el directorio fuente como en el de compilacion (windres se ejecuta
+# desde el directorio de compilacion, rc.exe resuelve junto al .rc).
+if(WIN32)
+    include_directories("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+endif()
+
 # Crear ejecutable principal
 add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${RESOURCES})
 
@@ -90,17 +102,12 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 # Vincular manifest para permisos de administrador
 if(WIN32)
-    # Configuraciones específicas para MSVC
+    # El manifiesto se incrusta via resources.rc (entrada RT_MANIFEST), lo que
+    # funciona tanto en MinGW como en MSVC. Se desactiva el manifiesto que el
+    # linker de MSVC genera por su cuenta para evitar duplicados.
     if(MSVC)
         set_target_properties(${PROJECT_NAME} PROPERTIES
             LINK_FLAGS "/MANIFEST:NO"
-        )
-    endif()
-    
-    # Agregar manifest como recurso (solo para MSVC)
-    if(MSVC)
-        target_sources(${PROJECT_NAME} PRIVATE
-            "${CMAKE_BINARY_DIR}/admin_manifest.manifest"
         )
     endif()
 endif()
@@ -120,6 +127,11 @@ install(TARGETS ${PROJECT_NAME}
     RUNTIME DESTINATION bin
 )
 
+# Valores por defecto del .ini. Sin este include los marcadores @...@ de la
+# plantilla quedaban vacios, generando un ScreenHighlighter.ini con lineas como
+# "overlay_opacity=" que la aplicacion no podia interpretar.
+include("${CMAKE_SOURCE_DIR}/config/CMakeConfig.cmake")
+
 # Configurar archivos de configuración - copiar a la raíz
 configure_file(
     "${CMAKE_SOURCE_DIR}/config/ScreenHighlighter.ini.in"
@@ -127,7 +139,14 @@ configure_file(
     @ONLY
 )
 
-# Configurar manifest para permisos de administrador
+# Configurar manifest para permisos de administrador.
+# Se genera junto a resources.rc para que windres (MinGW) lo encuentre por ruta
+# relativa: resources.rc lo incrusta con "1 24 admin_manifest.manifest".
+configure_file(
+    "${CMAKE_SOURCE_DIR}/config/admin_manifest.manifest.in"
+    "${CMAKE_SOURCE_DIR}/admin_manifest.manifest"
+    @ONLY
+)
 configure_file(
     "${CMAKE_SOURCE_DIR}/config/admin_manifest.manifest.in"
     "${CMAKE_BINARY_DIR}/admin_manifest.manifest"

@@ -21,3 +21,21 @@ region_border_color=@region_border_color@
 
 # Habilitar hotkey Shift+Alt+X (1=habilitado, 0=deshabilitado)
 hotkey_shift_alt_x=@hotkey_shift_alt_x@
+
+# Opacidad del resaltador (1-255)
+highlighter_alpha=110
+
+# Color de dibujo (COLORREF: 0x00BBGGRR)
+drawing_color=255
+
+# Grosor de linea (1-50)
+drawing_thickness=3
+
+# Relleno de las formas (1=si, 0=no)
+drawing_fill=0
+
+# Formato de guardado de capturas: png (por defecto) o bmp
+screenshot_format=png
+
+# Carpeta de guardado. Vacio = %USERPROFILE%\Pictures\Screenshots
+screenshot_folder=

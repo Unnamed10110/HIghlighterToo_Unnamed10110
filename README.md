@@ -8,13 +8,14 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 
 ### **🔍 Enhanced Zoom Experience**
 - ✅ **Automatic Text Copying**: When zooming into a region for the first time, any previously written text is automatically copied to the zoom view
-- ✅ **Clean Zoom Focus**: All drawing elements (lines, arrows, rectangles, highlighter) are hidden during zoom to provide a distraction-free experience focused solely on the zoomed region
 - ✅ **Smart Text Management**: Text is preserved and restored intelligently when entering/exiting zoom mode
-- ✅ **Seamless Transition**: Drawing elements reappear when zoom is deactivated, maintaining full functionality
+- ✅ **Annotations Stay Visible**: Drawing elements are rendered during zoom as well
+  (the code has always done this; earlier revisions of this README claimed they
+  were hidden, which did not match the behaviour)
 
 ### **🎨 Improved Drawing Experience**
-- ✅ **Context-Aware Rendering**: Drawing elements are conditionally rendered based on zoom state
-- ✅ **Enhanced Performance**: Reduced rendering overhead during zoom operations
+- ✅ **Enhanced Performance**: A cached back buffer and event-driven repaints
+  replaced the per-frame full-screen allocation and the polling loop
 - ✅ **Better User Experience**: Cleaner interface with focused attention on the zoomed content
 
 **👨‍💻 Developer**: Unnamed10110 | **📧 Contact**: trojan.v6@gmail.com | **📧 Alt Contact**: sergio.britos@gmail.com
@@ -23,7 +24,8 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 
 ### **Implemented Functionality**
 - ✅ **Screen capture** with region selection
-- ✅ **Annotation tools** (line, arrow, rectangle, highlighter)
+- ✅ **Annotation tools** (line, arrow, rectangle, ellipse, freehand pen,
+  highlighter, numbered step markers, and redaction/pixelation)
 - ✅ **Global hotkey system** (Shift+Alt+X)
 - ✅ **System tray integration** with custom icon
 - ✅ **System tray auto-restoration** when explorer.exe restarts
@@ -31,7 +33,7 @@ https://github.com/user-attachments/assets/f43ea938-9ba4-4d35-916f-59f4806266eb
 - ✅ **Professional executable icon** with Windows resource compilation
 - ✅ **Persistent configuration** with .ini file
 - ✅ **Zoom and capture** of specific regions
-- ✅ **Undo/Redo** of drawing elements
+- ✅ **Undo/Redo** of drawing elements (Ctrl+Z / Ctrl+Y)
 - ✅ **Complete screen capture**
 
 ### **Technical Improvements Implemented**
@@ -115,11 +117,12 @@ build.bat
 - **Use**: Production testing, QA
 
 #### **🚀 Release Mode (No Console)**
-- **Script**: `build_advanced.bat` (option 1)
 - **Optimization**: Maximum (`-O2`)
 - **Console**: Not visible
-- **Functionality**: ❌ **Known issues**
-- **Use**: ⚠️ **Not recommended until issues resolved**
+- **Functionality**: ✅ **Expected to work.** The data races that made `-O2` builds
+  misbehave have been fixed (see Known Issues). Configure with:
+  `cmake .. -DCMAKE_BUILD_TYPE=Release -DDEBUG_MODE=OFF -DSILENT_DEBUG=OFF`
+- **Use**: Production. Please report any remaining Release-only problem.
 
 ## 🎮 **Application Usage**
 
@@ -129,7 +132,17 @@ build.bat
 - **Administrator Privileges** - Required for full functionality
 - **CMake 3.16+** - For building from source
 - **MinGW-w64** or **Visual Studio 2019+** - C++ compiler
-- **C++17** compatible compiler
+- **C++23** compatible compiler (the CMake config requests C++23)
+
+### **Where Files Go**
+
+| What | Where |
+|------|-------|
+| Screenshots | `%USERPROFILE%\Pictures\Screenshots\` as **PNG**, named `dd_MM_yyyy-HH-mm-ss_fff.png`. Override the folder and format with `screenshot_folder` / `screenshot_format` in the config file. |
+| Configuration | `%APPDATA%\ScreenHighlighter\ScreenHighlighter.ini`. An older `.ini` sitting next to the executable is migrated automatically on first run. |
+| Auto-start entry | `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` |
+
+Every capture is also placed on the clipboard, so it can be pasted directly.
 
 ### **Advanced Features**
 - **🔐 Automatic Administrator Privileges**: UAC prompt and automatic elevation
@@ -138,6 +151,15 @@ build.bat
 - **🔍 Explorer.exe Monitoring**: Detects when Windows shell restarts and restores functionality
 - **🚀 Auto-Start on Login**: Option to automatically launch when Windows starts
 - **⚙️ Registry Management**: Automatic Windows registry configuration for startup
+- **🖥️ Multi-Monitor**: The overlay spans the whole virtual desktop, so every
+  display is covered. Zoom and the settings window follow the monitor under the
+  pointer.
+- **🔎 Per-Monitor DPI Awareness**: Declared `PerMonitorV2` in the manifest and set
+  at runtime as a fallback, so the overlay stays sharp on scaled displays and the
+  cursor tracks what is drawn.
+- **⚡ Event-Driven Rendering**: The overlay blocks in `GetMessage` and repaints on
+  `WM_PAINT`, so idle CPU use is ~0%. It previously polled on a `Sleep(16..50)`
+  loop and reallocated a full-screen bitmap on every frame.
 
 ### **Main Hotkeys**
 - **Shift + Alt + X** - Activate selection mode
@@ -145,9 +167,18 @@ build.bat
 - **F2** - Arrow tool
 - **F3** - Rectangle tool
 - **F4** - Highlighter tool
-- **Shift + Alt + X** (overlay activo) - Screen capture mode
+- **F5** - Ellipse tool
+- **F6** - Pen (freehand) tool
+- **F7** - Redact tool (pixelates the region - use before sharing screenshots)
+- **F8** - Numbered step marker
+- **Shift + Alt + X** (overlay active) - Screen capture mode
 - **Ctrl + Z** - Undo last element
+- **Ctrl + Y** / **Ctrl + Shift + Z** - Redo
+- **Ctrl + T** - Text input mode
 - **ESC** - Exit current mode
+
+While a drawing tool is active, a colour and thickness picker appears under the
+tool indicator in the top-left corner - click a swatch to change either.
 
 ### **Functionality**
 1. **Activate**: Press `Shift+Alt+X` or double-click the system tray icon
@@ -202,7 +233,7 @@ build.bat
 
 ```
 ScreenHighlighter/
-├── main.cpp                    # Main source code (5494 lines)
+├── main.cpp                    # Main source code (~6500 lines)
 ├── CMakeLists.txt             # CMake configuration
 ├── build.bat                  # Main compilation script
 ├── clean.bat                  # Clean build files script
@@ -441,22 +472,82 @@ build_advanced.bat
 - **Primary Email**: trojan.v6@gmail.com
 - **Secondary Email**: sergio.britos@gmail.com
 
-## 🐛 **Known Issues and Pending Bugs**
+## 🐛 **Known Issues**
 
-### **Highlighter Tool Issue**
-- **Problem**: Highlighter tool doesn't work when not in zoom mode
-- **Status**: Pending fix
-- **Workaround**: Use zoom mode to access highlighter functionality
+### **Fixed**
 
-### **Image Paste in Text Mode Issue**
-- **Problem**: Image pasting with Ctrl+T doesn't work when not in zoom mode
-- **Status**: Pending fix
-- **Workaround**: Use zoom mode to paste images in text mode
+#### **Highlighter Tool Issue** - FIXED
+- **Was**: Highlighter didn't work outside zoom mode
+- **Cause**: `DrawHighlighter` used `SetROP2(R2_MASKPEN)`, a bitwise AND against the
+  destination. Outside zoom the destination is the black overlay brush, so
+  `yellow AND black = black` - the highlight was mathematically invisible. Inside
+  zoom the destination was blitted screen content, so it happened to show up.
+- **Fix**: Real alpha blending via `AlphaBlend`, and the tool now honours the
+  selected colour (it previously discarded it and was always yellow).
 
-### **Release Mode Issue**
-- **Problem**: Pure Release mode doesn't work (known issue with -mwindows flag)
-- **Status**: Known issue
-- **Workaround**: Use Silent Debug Mode (`build_debug_silent.bat`) or Release + Console mode
+#### **Image Paste in Text Mode Issue** - FIXED
+- **Was**: Ctrl+T image paste didn't render outside zoom mode
+- **Cause**: The text renderer existed as two near-identical ~250-line copies in
+  `DrawOverlay`. Only the zoom copy drew the `[IMAGE_n]`/`[GIF_n]` markers; the
+  non-zoom copy handled them only while measuring the caret, and never handled
+  `[GIF_` at all.
+- **Fix**: Both call sites now use a single `TextRender::RenderAnnotationText`.
+
+#### **Text disappearing outside zoom mode** - FIXED
+- **Was**: Text vanished when leaving text-input mode outside zoom.
+- **Cause**: The non-zoom branch was gated on `text_input_mode`; the zoom branch
+  only required non-empty text. The two modes now behave the same.
+
+#### **Release Mode Issue** - ADDRESSED
+- **Was**: Pure Release mode misbehaved; blamed on the `-mwindows` flag.
+- **Actual cause**: `-mwindows` was a red herring - `WIN32_EXECUTABLE TRUE` passes
+  it at link time in every configuration. The real problem was undefined behaviour
+  that only surfaces under `-O2`: a detached cursor-blink thread read `zoom_text`
+  (a `std::wstring`) concurrently with the overlay thread mutating it, and several
+  other shared globals were non-atomic. At `-O0` every access reloaded from memory
+  so the races looked benign; at `-O2` values get cached in registers.
+- **Fix**: the blink thread was replaced with a `WM_TIMER` on the overlay window,
+  removing the race and the thread; `hCurrentOverlay` and `systemTrayInitialized`
+  are now atomic, and shared annotation state is guarded by a mutex.
+- **Please report** if any Release-mode problem remains.
+
+#### **Other fixes in this pass**
+- Screenshots were **BMP files written under a `.png` name** - now real PNGs
+  (~10x smaller), encoded with GDI+.
+- `SetClipboardData(CF_BITMAP, ...)` was followed by `DeleteObject` on the same
+  handle, so **copy-to-clipboard handed over a destroyed bitmap**. The clipboard
+  now receives an independent copy.
+- Screenshots **baked in the overlay's dark tint** - the overlay is now hidden for
+  the capture and the annotations are re-rendered onto the clean image.
+- Non-US keyboard layouts produced wrong punctuation, and the accented-character
+  branch was **unreachable dead code**. Text input now goes through `WM_CHAR`, so
+  layouts, dead keys, AltGr and IME all work.
+- Settings **silently failed to persist** when the app was launched at login: the
+  `.ini` path was relative and resolved against `system32`. It now lives in
+  `%APPDATA%\ScreenHighlighter\`.
+- The MinGW build **shipped with no manifest at all** (the CMake wiring was
+  `if(MSVC)`-only), so it had no `requireAdministrator`, no themed controls and no
+  DPI declaration. It is now embedded via `resources.rc`.
+- **File properties showed no version, company or description**, even though
+  `resources.rc` declared all three. `resources.rc` never included `winresrc.h`,
+  so `VS_VERSION_INFO` was an undefined identifier and the resource compiler gave
+  the version resource ID 0 - the data was embedded, but Windows looks for it at
+  ID 1. Verified fixed: the properties dialog now reports 2.0.0.0 / Unnamed10110.
+- The generated `ScreenHighlighter.ini` had **empty values** for every setting
+  (`overlay_opacity=` with nothing after it), because `config/CMakeConfig.cmake`,
+  which defines the template's substitution variables, was never `include()`d.
+- Drawing colour, thickness and fill were never saved and reset on every launch.
+- Changing the "resource mode" preset **erased the user's annotations** as a side
+  effect. It no longer does.
+- Two captures within the same second overwrote each other, and save failures were
+  completely silent.
+
+### **Remaining limitations**
+- Nothing is anti-aliased, and the colour-key transparency reserves magenta
+  `RGB(255,0,255)` and cyan `RGB(0,255,255)`, so those two exact colours cannot be
+  drawn. Fixing both requires moving the overlay to `UpdateLayeredWindow` with a
+  per-pixel-alpha surface, which is deliberately out of scope for this pass.
+- There is no automated test suite; verification is manual.
 
 ## 📞 **Support and Contact**
 
