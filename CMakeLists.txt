@@ -64,6 +64,7 @@ if(WIN32)
         shlwapi
         windowscodecs
         msimg32          # AlphaBlend (resaltador translucido)
+        advapi32         # Reg*, OpenProcessToken, GetUserNameW (auto-inicio)
     )
 endif()
 

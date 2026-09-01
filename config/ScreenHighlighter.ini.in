@@ -39,3 +39,32 @@ screenshot_format=png
 
 # Carpeta de guardado. Vacio = %USERPROFILE%\Pictures\Screenshots
 screenshot_folder=
+
+# Auto-inicio con Windows (tarea programada "Screen Highlighter").
+# La aplicacion se registra sola en cada arranque; poner 1 aqui, o usar
+# "Disable Auto-Start" en el menu del tray, hace que deje de hacerlo.
+autostart_user_disabled=0
+
+# Leyenda de atajos en el overlay (1=visible, 0=oculta). Se alterna con F9.
+show_shortcut_legend=1
+
+# Atajos de las herramientas de dibujo. Se admite una letra o digito ("A", "7")
+# o una tecla de funcion ("F1".."F24"). Si el valor no es valido se conserva el
+# que trae la aplicacion.
+#
+# Ojo: al ser letras sueltas, dentro del modo texto (Ctrl+T) no actuan como
+# atajo, porque ahi se escriben. Las teclas de funcion si siguen actuando.
+hotkey_arrow=A
+hotkey_line=L
+hotkey_rectangle=R
+hotkey_highlight=H
+hotkey_pixelate=B
+hotkey_step_number=S
+hotkey_ellipse=E
+hotkey_pen=P
+
+# Tecla que, combinada con Ctrl, entra en modo texto.
+hotkey_text=T
+
+# Tecla que muestra u oculta la leyenda de atajos del overlay.
+hotkey_toggle_legend=F9

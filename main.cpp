@@ -564,6 +564,30 @@ public:
     }
 };
 
+// Recorte de un DC con restauracion garantizada.
+//
+// El back buffer del overlay es persistente entre frames: si se sale de la
+// funcion de dibujado sin deshacer el recorte (por ejemplo por un return
+// temprano al fallar CreatePen), TODOS los frames siguientes quedarian
+// recortados a la zona de este, y el overlay pareceria congelado.
+class ScopedClipRegion {
+    HDC dc_;
+    HRGN rgn_;
+public:
+    ScopedClipRegion(HDC dc, const RECT& r)
+        : dc_(dc), rgn_(CreateRectRgn(r.left, r.top, r.right, r.bottom)) {
+        if (rgn_) SelectClipRgn(dc_, rgn_);
+    }
+    ~ScopedClipRegion() {
+        if (rgn_) {
+            SelectClipRgn(dc_, NULL);
+            DeleteObject(rgn_);
+        }
+    }
+    ScopedClipRegion(const ScopedClipRegion&) = delete;
+    ScopedClipRegion& operator=(const ScopedClipRegion&) = delete;
+};
+
 // Clase RAII para HBRUSH - gestión automática de pinceles
 class ScopedBrush {
     HBRUSH handle_;
@@ -743,10 +767,10 @@ enum class DrawingTool : uint8_t {
     Rectangle = 3,
     Text = 4,        // Mantenido para compatibilidad
     Highlighter = 5,
-    Ellipse = 6,     // F5 - elipse
-    Pen = 7,         // F6 - trazo libre
-    Redact = 8,      // F7 - pixelar (ocultar informacion sensible)
-    Step = 9         // F8 - numero de paso
+    Ellipse = 6,
+    Pen = 7,         // trazo libre
+    Redact = 8,      // pixelar (ocultar informacion sensible)
+    Step = 9         // numero de paso
 };
 
 // Enumeración para tipos de mensajes personalizados
@@ -860,6 +884,20 @@ std::wstring screenshot_folder;
 // Formato de guardado: "png" (por defecto) o "bmp".
 std::wstring screenshot_format = L"png";
 
+// Leyenda de atajos de teclado del overlay. Se muestra por defecto porque los
+// atajos (F1-F8, Ctrl+T...) no estaban indicados en ninguna parte de la interfaz;
+// se alterna con F9 y la eleccion se recuerda en el .ini.
+std::atomic<bool> show_shortcut_legend(true);
+
+// La aplicacion se registra sola para arrancar con Windows en cada inicio. Este
+// valor recuerda que el usuario la desactivo a mano desde el menu del tray, para
+// no volver a activarla en su contra en el siguiente arranque.
+std::atomic<int> autostart_user_disabled(0);
+// Estado del auto-inicio ya consultado. Comprobarlo de verdad implica lanzar
+// schtasks.exe, demasiado lento para hacerlo cada vez que se abre el menu del
+// tray; el menu lee esta copia, que se refresca al arrancar y tras cada cambio.
+std::atomic<bool> autostart_active(false);
+
 // Modos de recursos
 enum class ResourceMode {
     Normal = 0,
@@ -875,6 +913,110 @@ std::atomic<int> scroll_max(1000);  // Contenido total alto
 
 // Variables para herramientas de dibujo
 std::atomic<DrawingTool> current_drawing_tool{DrawingTool::None};
+
+// ============================================================================
+// ATAJOS DE HERRAMIENTA CONFIGURABLES
+// ============================================================================
+// Antes las herramientas estaban fijas en F1-F8. Ahora cada una tiene su tecla,
+// configurable desde el .ini, y los valores por defecto son letras mnemonicas.
+//
+// Al ser letras sueltas no pueden atenderse mientras se escribe texto: dentro
+// del modo texto solo se aceptan atajos que sean teclas de funcion (ver
+// ToolHotkeyAllowedWhileTyping).
+std::atomic<int> hotkey_tool_arrow('A');
+std::atomic<int> hotkey_tool_line('L');
+std::atomic<int> hotkey_tool_rectangle('R');
+std::atomic<int> hotkey_tool_highlighter('H');
+std::atomic<int> hotkey_tool_pixelate('B');
+std::atomic<int> hotkey_tool_step('S');
+// El usuario no fijo tecla para estas dos; se les asigna la inicial de su
+// nombre, siguiendo el mismo criterio que el resto.
+std::atomic<int> hotkey_tool_ellipse('E');
+std::atomic<int> hotkey_tool_pen('P');
+// Atajos que no seleccionan herramienta pero tambien se pueden reasignar.
+std::atomic<int> hotkey_tool_text('T');          // se usa con Ctrl
+std::atomic<int> hotkey_toggle_legend(VK_F9);
+
+struct ToolHotkey {
+    DrawingTool tool;
+    const char* iniKey;          // clave en el .ini
+    const wchar_t* label;        // nombre mostrado en la leyenda
+    std::atomic<int>* key;
+};
+
+// El orden es el que se muestra en la leyenda.
+const ToolHotkey kToolHotkeys[] = {
+    {DrawingTool::Arrow,       "hotkey_arrow",       L"Arrow",       &hotkey_tool_arrow},
+    {DrawingTool::Line,        "hotkey_line",        L"Line",        &hotkey_tool_line},
+    {DrawingTool::Rectangle,   "hotkey_rectangle",   L"Rectangle",   &hotkey_tool_rectangle},
+    {DrawingTool::Highlighter, "hotkey_highlight",   L"Highlight",   &hotkey_tool_highlighter},
+    {DrawingTool::Redact,      "hotkey_pixelate",    L"Pixelate",    &hotkey_tool_pixelate},
+    {DrawingTool::Step,        "hotkey_step_number", L"Step number", &hotkey_tool_step},
+    {DrawingTool::Ellipse,     "hotkey_ellipse",     L"Ellipse",     &hotkey_tool_ellipse},
+    {DrawingTool::Pen,         "hotkey_pen",         L"Pen",         &hotkey_tool_pen},
+};
+constexpr int kToolHotkeyCount =
+    static_cast<int>(sizeof(kToolHotkeys) / sizeof(kToolHotkeys[0]));
+
+// Las teclas de funcion no producen texto, asi que pueden seguir actuando como
+// atajo dentro del modo texto. Una letra, no.
+bool ToolHotkeyAllowedWhileTyping(int vk) {
+    return vk >= VK_F1 && vk <= VK_F24;
+}
+
+// Convierte el valor del .ini en un codigo de tecla virtual.
+// Acepta una letra o digito ("A", "7") y las teclas de funcion ("F1".."F24").
+// Devuelve fallback si el texto no es valido, para que un .ini editado a mano y
+// mal escrito no deje la herramienta sin atajo.
+int ParseHotkeyValue(const std::string& raw, int fallback) {
+    std::string text;
+    for (char c : raw) {
+        if (!isspace(static_cast<unsigned char>(c))) {
+            text += static_cast<char>(toupper(static_cast<unsigned char>(c)));
+        }
+    }
+    if (text.empty()) return fallback;
+
+    if (text.size() == 1) {
+        const char c = text[0];
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            return static_cast<int>(c);
+        }
+        return fallback;
+    }
+
+    if (text[0] == 'F') {
+        const std::string digits = text.substr(1);
+        if (!digits.empty() &&
+            digits.find_first_not_of("0123456789") == std::string::npos) {
+            const int n = std::atoi(digits.c_str());
+            if (n >= 1 && n <= 24) return VK_F1 + (n - 1);
+        }
+    }
+    return fallback;
+}
+
+// Nombre legible de una tecla, para el .ini y para la leyenda en pantalla.
+std::wstring HotkeyDisplayName(int vk) {
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        return L"F" + std::to_wstring(vk - VK_F1 + 1);
+    }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        return std::wstring(1, static_cast<wchar_t>(vk));
+    }
+    return L"?";
+}
+
+// Version estrecha para escribir en el .ini, que se guarda como texto ANSI.
+std::string HotkeyIniValue(int vk) {
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        return "F" + std::to_string(vk - VK_F1 + 1);
+    }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        return std::string(1, static_cast<char>(vk));
+    }
+    return "";
+}
 std::atomic<int> drawing_color(RGB(255, 0, 0)); // Color rojo por defecto
 std::atomic<int> drawing_thickness(3); // Grosor de línea
 std::atomic<bool> drawing_fill(false); // Relleno para formas
@@ -1122,6 +1264,47 @@ void RequestOverlayRedraw() {
     }
 }
 
+// Invalida solo una zona en vez de la ventana entera.
+//
+// Repintar el escritorio virtual completo cuesta ~4,4 ms por frame en dos
+// monitores 1080p (1,5 ms de FillRect + 2,6 ms de BitBlt sobre 4,1 Mpx), y eso
+// se pagaba en CADA WM_MOUSEMOVE mientras se arrastra. Las rutas de alta
+// frecuencia usan esta variante; el resto sigue invalidando todo, que es lo
+// seguro cuando cambia el estado general del overlay.
+void RequestOverlayRedrawRect(const RECT& rect) {
+    HWND overlay = hCurrentOverlay.load();
+    if (overlay) {
+        InvalidateRect(overlay, &rect, FALSE);
+    }
+}
+
+// Vista previa que ocupaba el arrastre en el frame anterior. Al mover el raton
+// solo cambian la banda elastica vieja y la nueva, asi que basta con invalidar
+// la union de ambas.
+static RECT g_lastPreviewRect = {0, 0, 0, 0};
+static bool g_hasLastPreviewRect = false;
+
+void ResetPreviewRectTracking() {
+    g_hasLastPreviewRect = false;
+}
+
+// Invalida la banda elastica anterior y la actual. El margen cubre el grosor del
+// trazo y las puntas de flecha, que pintan fuera de las coordenadas nominales.
+void RequestPreviewRedraw(int x1, int y1, int x2, int y2, int pad) {
+    RECT current = {std::min(x1, x2), std::min(y1, y2),
+                    std::max(x1, x2), std::max(y1, y2)};
+    InflateRect(&current, pad, pad);
+
+    RECT dirty = current;
+    if (g_hasLastPreviewRect) {
+        UnionRect(&dirty, &current, &g_lastPreviewRect);
+    }
+    g_lastPreviewRect = current;
+    g_hasLastPreviewRect = true;
+
+    RequestOverlayRedrawRect(dirty);
+}
+
 // Función para cargar configuración desde archivo .ini
 // Devuelve la ruta absoluta del archivo de configuracion, en
 // %APPDATA%\ScreenHighlighter\. Se usa APPDATA y no la carpeta del ejecutable
@@ -1232,6 +1415,25 @@ void LoadConfiguration() {
                     if (mode >= 0 && mode <= 2) {
                         current_resource_mode.store(static_cast<ResourceMode>(mode));
                     }
+                } else if (key == "autostart_user_disabled") {
+                    autostart_user_disabled.store(std::stoi(value) != 0 ? 1 : 0);
+                } else if (key == "show_shortcut_legend") {
+                    show_shortcut_legend.store(std::stoi(value) != 0);
+                } else if (key == "hotkey_text") {
+                    hotkey_tool_text.store(
+                        ParseHotkeyValue(value, hotkey_tool_text.load()));
+                } else if (key == "hotkey_toggle_legend") {
+                    hotkey_toggle_legend.store(
+                        ParseHotkeyValue(value, hotkey_toggle_legend.load()));
+                } else {
+                    // Atajos de herramienta: la tabla evita repetir una rama por
+                    // cada una y mantener dos listas que se desincronizan.
+                    for (const ToolHotkey& hk : kToolHotkeys) {
+                        if (key == hk.iniKey) {
+                            hk.key->store(ParseHotkeyValue(value, hk.key->load()));
+                            break;
+                        }
+                    }
                 }
             } catch (const std::exception&) {
                 // Ignorar valores inválidos
@@ -1261,6 +1463,17 @@ void SaveConfiguration() {
     file << "region_border_color=" << region_border_color.load() << std::endl;
     file << "hotkey_shift_alt_x=" << hotkey_shift_alt_x.load() << std::endl;
     file << "resource_mode=" << static_cast<int>(current_resource_mode.load()) << std::endl;
+    file << "autostart_user_disabled=" << autostart_user_disabled.load() << std::endl;
+    file << "show_shortcut_legend=" << (show_shortcut_legend.load() ? 1 : 0) << std::endl;
+
+    // Atajos de cada herramienta. Se guardan con su nombre legible ("A", "F1")
+    // para que se puedan editar a mano sin consultar codigos de tecla virtual.
+    for (const ToolHotkey& hk : kToolHotkeys) {
+        file << hk.iniKey << "=" << HotkeyIniValue(hk.key->load()) << std::endl;
+    }
+    file << "hotkey_text=" << HotkeyIniValue(hotkey_tool_text.load()) << std::endl;
+    file << "hotkey_toggle_legend=" << HotkeyIniValue(hotkey_toggle_legend.load())
+         << std::endl;
 
     // Estas cinco no se guardaban, por lo que el color, el grosor y el relleno
     // elegidos por el usuario se perdian en cada reinicio.
@@ -1863,143 +2076,417 @@ void StopExplorerMonitoring() {
 bool IsRunningAsAdministrator();
 void ShowAutoStartStatus();
 
-// Función para verificar si la aplicación está configurada para auto-ejecutarse
-bool IsAutoStartEnabled() {
+// ============================================================================
+// AUTO-INICIO CON WINDOWS
+// ============================================================================
+// La aplicacion pide privilegios de administrador en su manifiesto. Windows
+// ignora en silencio las entradas de HKCU\...\Run que apuntan a un ejecutable
+// elevado: al iniciar sesion no muestra el prompt de UAC y el programa
+// sencillamente no arranca. Por eso el mecanismo principal es una tarea
+// programada con RunLevel HighestAvailable, que si arranca elevada y sin
+// prompt. La entrada del registro se conserva solo como respaldo para el caso
+// en que schtasks.exe no este disponible (politicas de grupo restrictivas),
+// aunque en ese escenario el arranque seguira dependiendo de que el usuario
+// acepte el UAC.
+// ============================================================================
+
+constexpr const wchar_t* AUTOSTART_TASK_NAME = L"Screen Highlighter";
+constexpr const wchar_t* AUTOSTART_REGISTRY_VALUE = L"Screen Highlighter";
+constexpr const wchar_t* AUTOSTART_REGISTRY_KEY =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+// Ruta absoluta de schtasks.exe. Se resuelve desde el directorio de sistema y no
+// desde el PATH, que puede estar alterado.
+std::wstring GetSchTasksPath() {
+    wchar_t systemDir[MAX_PATH];
+    UINT len = GetSystemDirectoryW(systemDir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return L"schtasks.exe";
+    }
+    return std::wstring(systemDir) + L"\\schtasks.exe";
+}
+
+// Lanza un proceso sin consola visible y espera a que termine.
+// Devuelve true solo si el proceso arranco y salio con codigo 0.
+bool RunHiddenAndWait(const std::wstring& applicationPath,
+                      std::wstring commandLine,
+                      DWORD timeoutMs = 15000) {
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    // CreateProcessW puede escribir sobre lpCommandLine, de ahi que commandLine
+    // se reciba por valor: el buffer es propio y modificable.
+    if (!CreateProcessW(applicationPath.c_str(), &commandLine[0], NULL, NULL,
+                        FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        LogDebug("❌ No se pudo lanzar %ls: %ld\n", applicationPath.c_str(),
+                 GetLastError());
+        return false;
+    }
+
+    DWORD exitCode = static_cast<DWORD>(-1);
+    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+    } else {
+        LogDebug("⚠️ %ls no respondio en %lu ms; se termina\n",
+                 applicationPath.c_str(), timeoutMs);
+        TerminateProcess(pi.hProcess, 1);
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exitCode == 0;
+}
+
+// Escapa los caracteres que romperian el XML de la tarea. Las rutas de Windows
+// admiten '&' y comillas simples, asi que no es una precaucion teorica.
+std::wstring EscapeXml(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (wchar_t c : text) {
+        switch (c) {
+            case L'&':  out += L"&amp;";  break;
+            case L'<':  out += L"&lt;";   break;
+            case L'>':  out += L"&gt;";   break;
+            case L'"':  out += L"&quot;"; break;
+            case L'\'': out += L"&apos;"; break;
+            default:    out += c;         break;
+        }
+    }
+    return out;
+}
+
+// "DOMINIO\usuario", que es lo que espera el principal de la tarea. Se arma con
+// GetUserNameW mas %USERDOMAIN% para no enlazar Secur32 solo por GetUserNameEx.
+std::wstring GetCurrentUserSamName() {
+    // MAX_PATH (260) supera con holgura el maximo de un nombre de usuario (256).
+    wchar_t userName[MAX_PATH] = {};
+    DWORD userLen = MAX_PATH;
+    if (!GetUserNameW(userName, &userLen) || userName[0] == L'\0') {
+        LogDebug("❌ No se pudo obtener el nombre de usuario: %ld\n", GetLastError());
+        return L"";
+    }
+
+    wchar_t domain[MAX_PATH] = {};
+    DWORD domainLen = GetEnvironmentVariableW(L"USERDOMAIN", domain, MAX_PATH);
+    if (domainLen == 0 || domainLen >= MAX_PATH) {
+        // Sin USERDOMAIN se usa el nombre del equipo, que es el dominio efectivo
+        // de las cuentas locales.
+        DWORD computerLen = MAX_PATH;
+        if (!GetComputerNameW(domain, &computerLen)) {
+            return userName; // schtasks tambien acepta el nombre a secas
+        }
+    }
+
+    return std::wstring(domain) + L"\\" + userName;
+}
+
+// XML de la tarea programada. Se registra con /XML en vez de con los parametros
+// sueltos de schtasks porque /Create /SC ONLOGON no permite fijar el RunLevel ni
+// desactivar los limites de bateria, que son justamente lo que hace falta aqui.
+std::wstring BuildAutoStartTaskXml(const std::wstring& exePath,
+                                   const std::wstring& workingDir,
+                                   const std::wstring& userSamName) {
+    const std::wstring user = EscapeXml(userSamName);
+    return
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"  <RegistrationInfo>\r\n"
+        L"    <Description>Screen Highlighter - inicio automatico al abrir sesion.</Description>\r\n"
+        L"    <URI>\\" + EscapeXml(AUTOSTART_TASK_NAME) + L"</URI>\r\n"
+        L"  </RegistrationInfo>\r\n"
+        L"  <Triggers>\r\n"
+        L"    <LogonTrigger>\r\n"
+        L"      <Enabled>true</Enabled>\r\n"
+        L"      <UserId>" + user + L"</UserId>\r\n"
+        L"    </LogonTrigger>\r\n"
+        L"  </Triggers>\r\n"
+        L"  <Principals>\r\n"
+        L"    <Principal id=\"Author\">\r\n"
+        L"      <UserId>" + user + L"</UserId>\r\n"
+        L"      <LogonType>InteractiveToken</LogonType>\r\n"
+        // HighestAvailable es lo que evita el prompt de UAC al iniciar sesion.
+        L"      <RunLevel>HighestAvailable</RunLevel>\r\n"
+        L"    </Principal>\r\n"
+        L"  </Principals>\r\n"
+        L"  <Settings>\r\n"
+        L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        // Por defecto una tarea no arranca (y se detiene) con el equipo a
+        // bateria: en un portatil el programa no se iniciaria nunca desenchufado.
+        L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+        L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+        L"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+        L"    <StartWhenAvailable>false</StartWhenAvailable>\r\n"
+        L"    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+        L"    <IdleSettings>\r\n"
+        L"      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n"
+        L"      <RestartOnIdle>false</RestartOnIdle>\r\n"
+        L"    </IdleSettings>\r\n"
+        L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
+        L"    <Enabled>true</Enabled>\r\n"
+        L"    <Hidden>false</Hidden>\r\n"
+        L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+        L"    <WakeToRun>false</WakeToRun>\r\n"
+        // PT0S = sin limite. El valor por defecto (3 dias) mataria el proceso.
+        L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
+        L"    <Priority>7</Priority>\r\n"
+        L"  </Settings>\r\n"
+        L"  <Actions Context=\"Author\">\r\n"
+        L"    <Exec>\r\n"
+        L"      <Command>" + EscapeXml(exePath) + L"</Command>\r\n"
+        L"      <WorkingDirectory>" + EscapeXml(workingDir) + L"</WorkingDirectory>\r\n"
+        L"    </Exec>\r\n"
+        L"  </Actions>\r\n"
+        L"</Task>\r\n";
+}
+
+// Archivo temporal donde se deja el XML antes de pasarselo a schtasks.
+std::wstring CreateTempXmlPath() {
+    wchar_t tempDir[MAX_PATH];
+    DWORD len = GetTempPathW(MAX_PATH, tempDir);
+    if (len == 0 || len >= MAX_PATH) {
+        return L"";
+    }
+    wchar_t tempFile[MAX_PATH];
+    if (GetTempFileNameW(tempDir, L"shl", 0, tempFile) == 0) {
+        return L"";
+    }
+    return tempFile;
+}
+
+// schtasks /XML exige UTF-16 con BOM: sin la marca de orden interpreta el
+// archivo como ANSI y falla al parsear la declaracion XML.
+bool WriteUtf16FileWithBom(const std::wstring& path, const std::wstring& content) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LogDebug("❌ No se pudo crear %ls: %ld\n", path.c_str(), GetLastError());
+        return false;
+    }
+
+    const wchar_t bom = 0xFEFF;
+    DWORD written = 0;
+    bool ok = WriteFile(hFile, &bom, sizeof(bom), &written, NULL) &&
+              written == sizeof(bom);
+    if (ok) {
+        const DWORD bytes = static_cast<DWORD>(content.size() * sizeof(wchar_t));
+        ok = WriteFile(hFile, content.c_str(), bytes, &written, NULL) &&
+             written == bytes;
+    }
+    if (!ok) {
+        LogDebug("❌ Error escribiendo %ls: %ld\n", path.c_str(), GetLastError());
+    }
+
+    CloseHandle(hFile);
+    return ok;
+}
+
+// Ruta del ejecutable en ejecucion, o cadena vacia si no se puede determinar.
+std::wstring GetCurrentExePath() {
+    wchar_t exePath[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        LogDebug("❌ Error al obtener la ruta del ejecutable: %ld\n", GetLastError());
+        return L"";
+    }
+    return exePath;
+}
+
+bool IsScheduledTaskAutoStartEnabled() {
+    const std::wstring schtasks = GetSchTasksPath();
+    const std::wstring cmd = L"\"" + schtasks + L"\" /Query /TN \"" +
+                             AUTOSTART_TASK_NAME + L"\"";
+    return RunHiddenAndWait(schtasks, cmd, 10000);
+}
+
+bool EnableScheduledTaskAutoStart(const std::wstring& exePath) {
+    const std::wstring user = GetCurrentUserSamName();
+    if (user.empty()) {
+        return false;
+    }
+
+    std::wstring workingDir = exePath;
+    const size_t lastSlash = workingDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        workingDir = workingDir.substr(0, lastSlash);
+    }
+
+    const std::wstring xmlPath = CreateTempXmlPath();
+    if (xmlPath.empty()) {
+        LogDebug("❌ No se pudo crear el archivo temporal para el XML de la tarea\n");
+        return false;
+    }
+
+    bool ok = WriteUtf16FileWithBom(
+        xmlPath, BuildAutoStartTaskXml(exePath, workingDir, user));
+    if (ok) {
+        const std::wstring schtasks = GetSchTasksPath();
+        // /F sobrescribe la tarea existente, lo que hace la operacion idempotente
+        // y ademas corrige la ruta si el ejecutable cambio de carpeta.
+        const std::wstring cmd = L"\"" + schtasks + L"\" /Create /TN \"" +
+                                 AUTOSTART_TASK_NAME + L"\" /XML \"" + xmlPath +
+                                 L"\" /F";
+        ok = RunHiddenAndWait(schtasks, cmd);
+        LogDebug(ok ? "✅ Tarea programada de auto-inicio registrada\n"
+                    : "❌ schtasks no pudo registrar la tarea de auto-inicio\n");
+    }
+
+    DeleteFileW(xmlPath.c_str());
+    return ok;
+}
+
+bool DisableScheduledTaskAutoStart() {
+    if (!IsScheduledTaskAutoStartEnabled()) {
+        return true; // no existe: nada que borrar
+    }
+    const std::wstring schtasks = GetSchTasksPath();
+    const std::wstring cmd = L"\"" + schtasks + L"\" /Delete /TN \"" +
+                             AUTOSTART_TASK_NAME + L"\" /F";
+    return RunHiddenAndWait(schtasks, cmd);
+}
+
+bool IsRegistryAutoStartEnabled() {
     HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_READ, &hKey);
-    
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                0, KEY_READ, &hKey);
     if (result != ERROR_SUCCESS) {
         LogDebug("❌ Error opening registry key to verify auto-start: %ld\n", result);
         return false;
     }
-    
+
     wchar_t valueData[MAX_PATH];
     DWORD dataSize = sizeof(valueData);
     DWORD dataType = REG_SZ;
-    
-    // Verificar si existe el valor "Screen Highlighter"
-    result = RegQueryValueExW(hKey, L"Screen Highlighter", NULL, &dataType, 
-                             (LPBYTE)valueData, &dataSize);
-    
+    result = RegQueryValueExW(hKey, AUTOSTART_REGISTRY_VALUE, NULL, &dataType,
+                              (LPBYTE)valueData, &dataSize);
     RegCloseKey(hKey);
-    
+
     if (result == ERROR_SUCCESS) {
-        LogDebug("✅ Auto-start value found: %ls\n", valueData);
         return true;
-    } else if (result == ERROR_FILE_NOT_FOUND) {
-        LogDebug("ℹ️ Auto-start value not found\n");
-        return false;
-    } else {
+    } else if (result != ERROR_FILE_NOT_FOUND) {
         LogDebug("❌ Error reading auto-start value: %ld\n", result);
+    }
+    return false;
+}
+
+bool EnableRegistryAutoStart(const std::wstring& exePath) {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                0, KEY_WRITE, &hKey);
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error opening registry key for auto-start: %ld\n", result);
         return false;
     }
+
+    result = RegSetValueExW(
+        hKey, AUTOSTART_REGISTRY_VALUE, 0, REG_SZ, (const BYTE*)exePath.c_str(),
+        static_cast<DWORD>((exePath.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error configuring auto-start in registry: %ld\n", result);
+        return false;
+    }
+    return true;
+}
+
+bool DisableRegistryAutoStart() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                0, KEY_WRITE, &hKey);
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error opening registry key for auto-start: %ld\n", result);
+        return false;
+    }
+
+    result = RegDeleteValueW(hKey, AUTOSTART_REGISTRY_VALUE);
+    RegCloseKey(hKey);
+
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+}
+
+// Consulta real del estado, con el coste de lanzar schtasks. El menu del tray
+// usa autostart_active en su lugar.
+bool IsAutoStartEnabled() {
+    return IsScheduledTaskAutoStartEnabled() || IsRegistryAutoStartEnabled();
 }
 
 // Función para habilitar la auto-ejecución al iniciar sesión
 bool EnableAutoStart() {
     LogDebug("🔧 Attempting to enable auto-start...\n");
-    
-    // Verificar permisos de administrador
+
+    // Crear la tarea con RunLevel HighestAvailable requiere elevacion.
     if (!IsRunningAsAdministrator()) {
         LogDebug("❌ Administrator privileges required to configure auto-start\n");
         return false;
     }
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_WRITE, &hKey);
-    
-    if (result != ERROR_SUCCESS) {
-        LogDebug("❌ Error opening registry key for auto-start: %ld\n", result);
+
+    const std::wstring exePath = GetCurrentExePath();
+    if (exePath.empty()) {
         return false;
     }
-    
-    // Obtener la ruta completa del ejecutable
-    wchar_t exePath[MAX_PATH];
-    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
-        LogDebug("❌ Error al obtener ruta del ejecutable: %ld\n", GetLastError());
-        RegCloseKey(hKey);
+    if (GetFileAttributesW(exePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        LogDebug("❌ El archivo ejecutable no existe o no es accesible: %ld\n",
+                 GetLastError());
         return false;
     }
-    
-    LogDebug("📁 Ruta del ejecutable: %ls\n", exePath);
-    
-    // Verificar que el archivo existe
-    DWORD fileAttributes = GetFileAttributesW(exePath);
-    if (fileAttributes == INVALID_FILE_ATTRIBUTES) {
-        LogDebug("❌ El archivo ejecutable no existe o no es accesible: %ld\n", GetLastError());
-        RegCloseKey(hKey);
-        return false;
+    LogDebug("📁 Ruta del ejecutable: %ls\n", exePath.c_str());
+
+    if (EnableScheduledTaskAutoStart(exePath)) {
+        // Con la tarea en pie, una entrada en Run heredada de una version
+        // anterior solo serviria para intentar un segundo arranque.
+        DisableRegistryAutoStart();
+        autostart_active.store(true);
+        return true;
     }
-    
-    // Crear la entrada en el registro
-    result = RegSetValueExW(hKey, L"Screen Highlighter", 0, REG_SZ, 
-        (const BYTE*)exePath, (wcslen(exePath) + 1) * sizeof(wchar_t));
-    
-    RegCloseKey(hKey);
-    
-    if (result == ERROR_SUCCESS) {
+
+    LogDebug("⚠️ Sin tarea programada; se recurre a HKCU\\...\\Run (puede quedar "
+             "bloqueado por UAC al iniciar sesion)\n");
+    const bool ok = EnableRegistryAutoStart(exePath);
+    autostart_active.store(ok);
+    if (ok) {
         LogDebug("✅ Auto-start enabled successfully in registry\n");
-        
-        // Verificar que se escribió correctamente
-        if (IsAutoStartEnabled()) {
-            LogDebug("✅ Verification successful: auto-start is enabled\n");
-            return true;
-        } else {
-            LogDebug("⚠️ Auto-start was written but cannot be verified\n");
-            return false;
-        }
-    } else {
-        LogDebug("❌ Error configuring auto-start in registry: %ld\n", result);
-        return false;
     }
+    return ok;
 }
 
 // Función para deshabilitar la auto-ejecución al iniciar sesión
 bool DisableAutoStart() {
     LogDebug("🔧 Attempting to disable auto-start...\n");
-    
-    // Verificar permisos de administrador
+
     if (!IsRunningAsAdministrator()) {
         LogDebug("❌ Administrator privileges required to configure auto-start\n");
         return false;
     }
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_WRITE, &hKey);
-    
-    if (result != ERROR_SUCCESS) {
-        LogDebug("❌ Error opening registry key for auto-start: %ld\n", result);
-        return false;
+
+    // Se intentan los dos mecanismos aunque uno falle: dejar el otro activo
+    // haria que el programa siguiera arrancando solo.
+    const bool taskRemoved = DisableScheduledTaskAutoStart();
+    const bool registryRemoved = DisableRegistryAutoStart();
+    const bool ok = taskRemoved && registryRemoved;
+
+    autostart_active.store(ok ? false : IsAutoStartEnabled());
+    LogDebug(ok ? "✅ Auto-start disabled successfully\n"
+                : "❌ Error disabling auto-start\n");
+    return ok;
+}
+
+// Registra el auto-inicio en cada arranque, salvo que el usuario lo haya
+// desactivado a mano desde el tray. Volver a registrar es barato e idempotente,
+// y de paso reapunta la tarea si el ejecutable cambio de carpeta.
+void EnsureAutoStartConfigured() {
+    if (autostart_user_disabled.load() != 0) {
+        LogDebug("🚫 Auto-inicio desactivado por el usuario; no se reactiva\n");
+        autostart_active.store(IsAutoStartEnabled());
+        return;
     }
-    
-    // Eliminar la entrada del registro
-    result = RegDeleteValueW(hKey, L"Screen Highlighter");
-    
-    RegCloseKey(hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        LogDebug("✅ Auto-start disabled successfully from registry\n");
-        
-        // Verificar que se eliminó correctamente
-        if (!IsAutoStartEnabled()) {
-            LogDebug("✅ Verification successful: auto-start is disabled\n");
-            return true;
-        } else {
-            LogDebug("⚠️ Auto-start was removed but cannot be verified\n");
-            return false;
-        }
-    } else if (result == ERROR_FILE_NOT_FOUND) {
-        LogDebug("ℹ️ Auto-start was already disabled\n");
-        return true;
+
+    if (EnableAutoStart()) {
+        LogDebug("🚀 Auto-start on login: ENABLED\n");
     } else {
-        LogDebug("❌ Error disabling auto-start from registry: %ld\n", result);
-        return false;
+        LogDebug("❌ No se pudo configurar el auto-inicio\n");
     }
 }
 
@@ -2032,7 +2519,9 @@ void ShowTrayMenu() {
     
     // Agregar opciones de auto-ejecución
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    if (IsAutoStartEnabled()) {
+    // Se lee la copia cacheada: consultar el estado real lanza schtasks.exe y el
+    // menu tardaria en abrirse.
+    if (autostart_active.load()) {
         AppendMenuW(hMenu, MF_STRING, MENU_DISABLE_AUTOSTART_ID, L"🚫 Disable Auto-Start");
     } else {
         AppendMenuW(hMenu, MF_STRING, MENU_ENABLE_AUTOSTART_ID, L"✅ Enable Auto-Start");
@@ -2328,8 +2817,8 @@ void SaveScreenshotToDownloads(HBITMAP hBitmap, int x1, int y1, int x2, int y2) 
         OutputDebugStringW((L"Screen Highlighter: fallo al guardar " + fullPath +
                             L"\n").c_str());
         MessageBoxW(NULL,
-            (L"No se pudo guardar la captura en:\n\n" + fullPath +
-             L"\n\nVerifique los permisos de la carpeta.").c_str(),
+            (L"Could not save the screenshot to:\n\n" + fullPath +
+             L"\n\nCheck the folder permissions.").c_str(),
             L"Screen Highlighter", MB_OK | MB_ICONWARNING);
     }
 }
@@ -3008,6 +3497,11 @@ void ReleaseOverlayBackBuffer() {
     g_overlayBackHeight = 0;
 }
 
+// Un back buffer recien creado tiene contenido indefinido, asi que el primer
+// frame que lo use debe pintarse entero aunque solo se haya invalidado una zona:
+// si no, el resto de la pantalla queda con basura.
+static bool g_overlayBackBufferIsFresh = false;
+
 // Devuelve el DC del back buffer, creandolo solo si no existe o si cambio el
 // tamaño. El bitmap queda seleccionado permanentemente en el DC.
 HDC AcquireOverlayBackBuffer(HDC hdc, int width, int height) {
@@ -3018,6 +3512,7 @@ HDC AcquireOverlayBackBuffer(HDC hdc, int width, int height) {
     }
 
     ReleaseOverlayBackBuffer();
+    g_overlayBackBufferIsFresh = true;
 
     HDC dc = CreateCompatibleDC(hdc);
     if (!dc) return nullptr;
@@ -3156,8 +3651,197 @@ bool HitTest(int x, int y) {
 
 } // namespace Toolbar
 
+// ============================================================================
+// LEYENDA DE ATAJOS DE TECLADO
+// ============================================================================
+// Los atajos del overlay solo estaban documentados en el README: desde la propia
+// aplicacion no habia forma de descubrir cual es la tecla de cada herramienta.
+// Este panel las lista mientras el overlay esta activo y se oculta con F9.
+//
+// Las filas de herramienta se generan a partir de kToolHotkeys, de modo que
+// reasignar una tecla en el .ini se refleja aqui automaticamente en vez de
+// dejar la leyenda mintiendo.
+//
+// Se dibuja en la esquina inferior izquierda para no chocar con el indicador de
+// herramienta ni con la barra de colores, que ocupan la esquina superior
+// izquierda.
+namespace ShortcutLegend {
+
+struct Entry {
+    std::wstring keys;
+    std::wstring action;
+};
+
+// Atajos que no seleccionan herramienta. El de la leyenda y el de texto se
+// formatean aparte porque dependen de su propia tecla configurable.
+struct FixedEntry {
+    const wchar_t* keys;
+    const wchar_t* action;
+};
+constexpr FixedEntry kFixedEntries[] = {
+    {L"Ctrl+Z",      L"Undo"},
+    {L"Ctrl+Y",      L"Redo"},
+    {L"Wheel",       L"Zoom region"},
+    {L"Shift+Alt+X", L"Screenshot"},
+    {L"Esc",         L"Back / exit"},
+};
+constexpr int kFixedCount =
+    static_cast<int>(sizeof(kFixedEntries) / sizeof(kFixedEntries[0]));
+
+// herramientas + Ctrl+T + los fijos + F9
+constexpr int kCount = kToolHotkeyCount + 1 + kFixedCount + 1;
+
+// Las filas se rearman solo cuando cambia alguna tecla, no en cada frame: el
+// panel se dibuja dentro del bucle de pintado.
+const std::vector<Entry>& Rows() {
+    static std::vector<Entry> cached;
+    static std::vector<int> snapshot;
+
+    std::vector<int> current;
+    current.reserve(kToolHotkeyCount + 2);
+    for (const ToolHotkey& hk : kToolHotkeys) current.push_back(hk.key->load());
+    current.push_back(hotkey_tool_text.load());
+    current.push_back(hotkey_toggle_legend.load());
+
+    if (current == snapshot && !cached.empty()) return cached;
+
+    snapshot = current;
+    cached.clear();
+    cached.reserve(kCount);
+    for (const ToolHotkey& hk : kToolHotkeys) {
+        cached.push_back(Entry{HotkeyDisplayName(hk.key->load()), hk.label});
+    }
+    cached.push_back(Entry{L"Ctrl+" + HotkeyDisplayName(hotkey_tool_text.load()),
+                           L"Text"});
+    for (const FixedEntry& fe : kFixedEntries) {
+        cached.push_back(Entry{fe.keys, fe.action});
+    }
+    cached.push_back(Entry{HotkeyDisplayName(hotkey_toggle_legend.load()),
+                           L"Hide this help"});
+    return cached;
+}
+
+constexpr int kColumns = 2;
+constexpr int kRows = (kCount + kColumns - 1) / kColumns;
+
+constexpr int kMargin = 20;         // separacion respecto al borde de pantalla
+constexpr int kPadding = 12;        // margen interior del panel
+constexpr int kRowHeight = 19;
+constexpr int kKeyWidth = 76;       // cabe "Shift+Alt+X" (62 px medidos)
+constexpr int kActionWidth = 106;   // cabe "Hide this help" / "Step number"
+constexpr int kColumnWidth = kKeyWidth + kActionWidth;
+constexpr int kColumnGap = 14;
+constexpr int kTitleHeight = 22;
+
+constexpr int kPanelWidth =
+    kPadding * 2 + kColumns * kColumnWidth + (kColumns - 1) * kColumnGap;
+constexpr int kPanelHeight = kPadding * 2 + kTitleHeight + kRows * kRowHeight;
+
+// Ni el fondo ni el texto pueden usar magenta RGB(255,0,255) ni cian
+// RGB(0,255,255): son los colores clave de LWA_COLORKEY y el panel se volveria
+// invisible justo encima de las regiones transparentes.
+constexpr COLORREF kPanelColor = RGB(18, 18, 18);
+constexpr COLORREF kBorderColor = RGB(120, 120, 120);
+constexpr COLORREF kTitleColor = RGB(255, 215, 0);
+constexpr COLORREF kKeyColor = RGB(120, 220, 120);
+constexpr COLORREF kActionColor = RGB(235, 235, 235);
+
+void Draw(HDC hdc, int screenWidth, int screenHeight) {
+    if (!show_shortcut_legend.load()) return;
+
+    // Si la pantalla es demasiado pequena para el panel se omite, en vez de
+    // dibujarlo recortado sobre el contenido.
+    if (screenWidth < kPanelWidth + kMargin * 2 ||
+        screenHeight < kPanelHeight + kMargin * 2) {
+        return;
+    }
+
+    const int left = kMargin;
+    const int top = screenHeight - kMargin - kPanelHeight;
+    RECT panel = {left, top, left + kPanelWidth, top + kPanelHeight};
+
+    ScopedBrush panelBrush(CreateSolidBrush(kPanelColor), true);
+    if (panelBrush) FillRect(hdc, &panel, panelBrush);
+
+    HPEN borderPen = GdiCache::GetPenCached(kBorderColor, 1);
+    HPEN oldPen = (HPEN)SelectObject(hdc, borderPen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, panel.left, panel.top, panel.right, panel.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+
+    const int prevBkMode = SetBkMode(hdc, TRANSPARENT);
+
+    HFONT oldFont = (HFONT)SelectObject(hdc, GdiCache::hCachedFontIndicator);
+    SetTextColor(hdc, kTitleColor);
+    RECT titleRect = {left + kPadding, top + kPadding,
+                      panel.right - kPadding, top + kPadding + kTitleHeight};
+    DrawTextW(hdc, L"SHORTCUTS", -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(hdc, GdiCache::hCachedFont);
+    const std::vector<Entry>& rows = Rows();
+    const int firstRowY = top + kPadding + kTitleHeight;
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+        // Se rellena por columnas: la primera se completa antes de pasar a la
+        // segunda, que es como se lee una lista de atajos.
+        const int column = i / kRows;
+        const int row = i % kRows;
+        const int cellX = left + kPadding + column * (kColumnWidth + kColumnGap);
+        const int cellY = firstRowY + row * kRowHeight;
+
+        RECT keyRect = {cellX, cellY, cellX + kKeyWidth, cellY + kRowHeight};
+        SetTextColor(hdc, kKeyColor);
+        DrawTextW(hdc, rows[i].keys.c_str(), -1, &keyRect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        RECT actionRect = {cellX + kKeyWidth, cellY,
+                           cellX + kColumnWidth, cellY + kRowHeight};
+        SetTextColor(hdc, kActionColor);
+        DrawTextW(hdc, rows[i].action.c_str(), -1, &actionRect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectObject(hdc, oldFont);
+    SetBkMode(hdc, prevBkMode);
+}
+
+} // namespace ShortcutLegend
+
+// Rectangulo que ocupa un elemento ya dibujado. Se usa para descartarlo cuando
+// no toca la zona que se esta repintando: sin esto, un pixelado fuera de la zona
+// seguiria costando un DC, un bitmap y dos StretchBlt por frame, porque el
+// recorte de GDI no llega a evitar el trabajo sobre el DC temporal.
+RECT DrawingElementBounds(const DrawingElement& e) {
+    RECT r;
+    if (e.tool_type == DrawingTool::Pen) {
+        if (e.points.empty()) return RECT{0, 0, 0, 0};
+        LONG minX = e.points[0].x, maxX = e.points[0].x;
+        LONG minY = e.points[0].y, maxY = e.points[0].y;
+        for (const POINT& p : e.points) {
+            minX = std::min<LONG>(minX, p.x);
+            maxX = std::max<LONG>(maxX, p.x);
+            minY = std::min<LONG>(minY, p.y);
+            maxY = std::max<LONG>(maxY, p.y);
+        }
+        r = RECT{minX, minY, maxX, maxY};
+    } else {
+        r = RECT{std::min(e.x1, e.x2), std::min(e.y1, e.y2),
+                 std::max(e.x1, e.x2), std::max(e.y1, e.y2)};
+    }
+    // Margen holgado a proposito: el marcador de paso dibuja un circulo de hasta
+    // 40 px de radio alrededor de su punto, y las flechas sobresalen del
+    // segmento. Descartar de menos solo cuesta tiempo; de mas deja restos.
+    const int pad = std::max(e.thickness * 4, 48);
+    InflateRect(&r, pad, pad);
+    return r;
+}
+
 // Función para dibujar el overlay
-void DrawOverlay(HDC hdc, int width, int height) {
+//
+// paintRect es la zona invalidada (ps.rcPaint). Todo el dibujado se recorta a
+// ella y solo esa zona se vuelca a la ventana, de modo que arrastrar el raton
+// deja de costar un repintado del escritorio virtual entero.
+void DrawOverlay(HDC hdc, int width, int height, const RECT& paintRect) {
     // Este frame lee zoom_text, screenRectangles, drawing_elements,
     // clipboard_images y gif_elements, todos objetos no atomicos compartidos con
     // el hilo principal. Se toma el candado una sola vez por frame.
@@ -3182,12 +3866,24 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // que es el color que se usa cuando drawing_active es true
         COLORREF transparentColor = drawing_active.load() ? RGB(0, 255, 255) : RGB(255, 0, 255);
 
+        // La cache incluye el handle a proposito. El overlay se crea y se
+        // destruye en cada activacion, y la ventana nueva nace solo con
+        // LWA_ALPHA, sin color clave. Comparando unicamente color y opacidad,
+        // los valores cacheados de la activacion anterior seguian coincidiendo
+        // y la llamada se omitia: la ventana nueva se quedaba sin LWA_COLORKEY
+        // y el interior de la region se veia magenta en vez de transparente a
+        // partir del segundo uso.
+        HWND overlayWnd = hCurrentOverlay.load();
+        static HWND lastOverlayWindow = NULL;
         static COLORREF lastTransparentColor = CLR_INVALID;
         static int lastOpacity = -1;
-        if (transparentColor != lastTransparentColor || userOpacity != lastOpacity) {
-            SetLayeredWindowAttributes(hCurrentOverlay.load(), transparentColor,
+        if (overlayWnd != lastOverlayWindow ||
+            transparentColor != lastTransparentColor ||
+            userOpacity != lastOpacity) {
+            SetLayeredWindowAttributes(overlayWnd, transparentColor,
                                        static_cast<BYTE>(userOpacity),
                                        LWA_COLORKEY | LWA_ALPHA);
+            lastOverlayWindow = overlayWnd;
             lastTransparentColor = transparentColor;
             lastOpacity = userOpacity;
         }
@@ -3197,6 +3893,30 @@ void DrawOverlay(HDC hdc, int width, int height) {
     // pantalla completa en CADA frame (~8 MB en 1080p, ~33 MB en 4K).
     HDC hMemDC = AcquireOverlayBackBuffer(hdc, width, height);
     if (!hMemDC) return;
+
+    // Zona a repintar. El back buffer conserva el frame anterior, asi que lo que
+    // quede fuera del recorte sigue siendo valido... salvo si el buffer se acaba
+    // de crear, en cuyo caso su contenido es basura y hay que pintarlo entero.
+    RECT requested = paintRect;
+    const RECT fullScreenRect = {0, 0, width, height};
+    if (g_overlayBackBufferIsFresh) {
+        requested = fullScreenRect;
+        g_overlayBackBufferIsFresh = false;
+    }
+    // Destino distinto de las fuentes: IntersectRect no garantiza que se pueda
+    // pasar el mismo RECT como entrada y salida.
+    RECT dirty = {0, 0, 0, 0};
+    if (!IntersectRect(&dirty, &requested, &fullScreenRect)) {
+        return; // nada que pintar
+    }
+
+    // Recortar TODO el dibujado a la zona sucia. GDI descarta por su cuenta lo
+    // que cae fuera, incluido el FillRect del fondo de pantalla completa, que es
+    // el que dominaba el coste por frame.
+    //
+    // Va por RAII porque mas abajo hay returns tempranos (fallos al crear pincel
+    // o lapiz) que dejarian el back buffer recortado para siempre.
+    ScopedClipRegion clipGuard(hMemDC, dirty);
             // Dibujar overlay negro en toda la pantalla (usando cache optimizado)
     RECT fullRect = {0, 0, width, height};
         FillRect(hMemDC, &fullRect, GdiCache::hOverlayBrush);
@@ -3373,11 +4093,11 @@ void DrawOverlay(HDC hdc, int width, int height) {
             case DrawingTool::Arrow: toolText = L"🏹 ARROW"; break;
             case DrawingTool::Rectangle: toolText = L"🔲 RECTANGLE"; break;
             // Case 4 (Text) removed
-            case DrawingTool::Highlighter: toolText = L"🎨 HIGHLIGHTER"; break;
+            case DrawingTool::Highlighter: toolText = L"🎨 HIGHLIGHT"; break;
             case DrawingTool::Ellipse: toolText = L"⭕ ELLIPSE"; break;
             case DrawingTool::Pen: toolText = L"🖊️ PEN"; break;
-            case DrawingTool::Redact: toolText = L"🔒 REDACT"; break;
-            case DrawingTool::Step: toolText = L"①  STEP"; break;
+            case DrawingTool::Redact: toolText = L"🔒 PIXELATE"; break;
+            case DrawingTool::Step: toolText = L"①  STEP NUMBER"; break;
         }
         
         // Fondo del indicador
@@ -3556,6 +4276,12 @@ void DrawOverlay(HDC hdc, int width, int height) {
     
     // Dibujar todos los elementos de dibujo (funciona también durante el zoom)
     for (const auto& element : drawing_elements) {
+        // Los elementos que no tocan la zona repintada no se dibujan: sus pixeles
+        // ya estan en el back buffer del frame anterior.
+        RECT elementBounds = DrawingElementBounds(element);
+        RECT unused;
+        if (!IntersectRect(&unused, &elementBounds, &dirty)) continue;
+
         switch (element.tool_type) {
             case DrawingTool::Line: // Línea
                 DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
@@ -3596,8 +4322,14 @@ void DrawOverlay(HDC hdc, int width, int height) {
         DrawPenStroke(hMemDC, pen_stroke, drawing_color.load(), drawing_thickness.load());
     }
     
-    // Copiar el resultado al DC principal (doble buffering)
-    BitBlt(hdc, 0, 0, width, height, hMemDC, 0, 0, SRCCOPY);
+    // La leyenda va al final para quedar por encima de todo lo demas.
+    ShortcutLegend::Draw(hMemDC, width, height);
+
+    // Copiar al DC de la ventana solo la zona repintada. El recorte de hMemDC
+    // sigue activo, pero BitBlt solo aplica el del destino, asi que no estorba.
+    BitBlt(hdc, dirty.left, dirty.top,
+           dirty.right - dirty.left, dirty.bottom - dirty.top,
+           hMemDC, dirty.left, dirty.top, SRCCOPY);
 
     // El bitmap sigue seleccionado en el back buffer cacheado; se libera en
     // ReleaseOverlayBackBuffer al cerrar el overlay.
@@ -3696,15 +4428,38 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     currentY += 25;
     
             // Herramientas
-        RECT toolsRect = {90, currentY, width - 50, currentY + 20};
+        // Las teclas se leen de kToolHotkeys en vez de estar escritas a mano:
+        // asi el panel no queda mintiendo cuando se reasignan en el .ini.
         SetTextColor(hMemDC, RGB(150, 150, 150)); // Gris medio
-        DrawTextW(hMemDC, L"F1 = Line | F2 = Arrow | F3 = Rectangle | F4 = Highlighter", -1, &toolsRect, DT_LEFT | DT_TOP);
-        currentY += 25;
-        RECT tools2Rect = {90, currentY, width - 50, currentY + 20};
-        DrawTextW(hMemDC, L"F5 = Ellipse | F6 = Pen | F7 = Redact (pixelate) | F8 = Step number", -1, &tools2Rect, DT_LEFT | DT_TOP);
-        currentY += 25;
+        for (int row = 0; row < 2; ++row) {
+            const int first = row * 4;
+            const int last = std::min(first + 4, kToolHotkeyCount);
+            if (first >= last) break;
+
+            std::wstring lineText;
+            for (int i = first; i < last; ++i) {
+                if (!lineText.empty()) lineText += L"  |  ";
+                lineText += HotkeyDisplayName(kToolHotkeys[i].key->load());
+                lineText += L" = ";
+                lineText += kToolHotkeys[i].label;
+            }
+
+            RECT toolsRect = {90, currentY, width - 50, currentY + 20};
+            DrawTextW(hMemDC, lineText.c_str(), -1, &toolsRect, DT_LEFT | DT_TOP);
+            currentY += 25;
+        }
+
         RECT toolsDescRect = {90, currentY, width - 50, currentY + 20};
-        DrawTextW(hMemDC, L"Ctrl+Z = Undo | Ctrl+Y = Redo | ESC = Exit drawing mode", -1, &toolsDescRect, DT_LEFT | DT_TOP);
+        const std::wstring editText =
+            L"Ctrl+" + HotkeyDisplayName(hotkey_tool_text.load()) + L" = Text  |  "
+            L"Ctrl+Z = Undo  |  Ctrl+Y = Redo  |  ESC = Exit drawing mode";
+        DrawTextW(hMemDC, editText.c_str(), -1, &toolsDescRect, DT_LEFT | DT_TOP);
+        currentY += 25;
+        RECT legendHintRect = {90, currentY, width - 50, currentY + 20};
+        const std::wstring legendText =
+            HotkeyDisplayName(hotkey_toggle_legend.load()) +
+            L" = Show/hide the shortcut legend on the overlay";
+        DrawTextW(hMemDC, legendText.c_str(), -1, &legendHintRect, DT_LEFT | DT_TOP);
         currentY += 25;
         
         // Captura de pantalla
@@ -4391,6 +5146,46 @@ void ShowSettingsOverlay() {
 }
 
 // Función para manejar eventos del mouse en el overlay
+// Atiende los atajos configurables: seleccion de herramienta y leyenda.
+// Devuelve true si la tecla se consumio.
+//
+// Va en una funcion aparte para que el case WM_KEYDOWN pueda seguir siendo una
+// cadena de if/else sin declaraciones locales.
+bool HandleConfigurableHotkey(WPARAM wParam) {
+    // Ctrl esta reservado para Ctrl+Z / Ctrl+Y / Ctrl+T: si esta pulsado, la
+    // tecla no es un atajo de herramienta aunque coincida la letra.
+    if (GetKeyState(VK_CONTROL) & 0x8000) return false;
+
+    const int pressed = static_cast<int>(wParam);
+    const bool typing = text_input_mode.load();
+
+    for (const ToolHotkey& hk : kToolHotkeys) {
+        const int toolKey = hk.key->load();
+        if (pressed != toolKey) continue;
+        // Dentro del modo texto una letra suelta es texto que el usuario quiere
+        // escribir, no un atajo. Las teclas de funcion si se aceptan.
+        if (typing && !ToolHotkeyAllowedWhileTyping(toolKey)) return false;
+        current_drawing_tool.store(hk.tool);
+        drawing_active.store(true);
+        text_input_mode.store(false);
+        RequestOverlayRedraw();
+        return true;
+    }
+
+    const int legendKey = hotkey_toggle_legend.load();
+    if (pressed == legendKey &&
+        (!typing || ToolHotkeyAllowedWhileTyping(legendKey))) {
+        // Se guarda para que quien oculte la leyenda no se la vuelva a encontrar
+        // en el siguiente uso.
+        show_shortcut_legend.store(!show_shortcut_legend.load());
+        SaveConfiguration();
+        RequestOverlayRedraw();
+        return true;
+    }
+
+    return false;
+}
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         // Todo el dibujado pasa por aqui. Antes el overlay no tenia handler de
@@ -4401,7 +5196,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT rc;
             GetClientRect(hwnd, &rc);
-            DrawOverlay(hdc, rc.right - rc.left, rc.bottom - rc.top);
+            // ps.rcPaint acota el trabajo al area realmente invalidada. Si viene
+            // vacio (puede pasar tras un EndPaint sin region) se pinta todo.
+            RECT paintRect = ps.rcPaint;
+            if (IsRectEmpty(&paintRect)) paintRect = rc;
+            DrawOverlay(hdc, rc.right - rc.left, rc.bottom - rc.top, paintRect);
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -4466,6 +5265,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         }
 
         case WM_LBUTTONDOWN:
+            // Empieza un arrastre nuevo: la vista previa del anterior ya no sirve
+            // como referencia para la union de rectangulos sucios.
+            ResetPreviewRectTracking();
             if (screenshot_mode.load()) {
                 // Modo captura de pantalla
                 screenshot_start_x.store(GET_X_LPARAM(lParam));
@@ -4526,7 +5328,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Modo captura - mostrar preview
                 screenshot_end_x.store(GET_X_LPARAM(lParam));
                 screenshot_end_y.store(GET_Y_LPARAM(lParam));
-                RequestOverlayRedraw();
+                // El recuadro de captura lleva un rotulo debajo, de ahi el margen
+                // extra respecto al resto de vistas previas.
+                RequestPreviewRedraw(screenshot_start_x.load(), screenshot_start_y.load(),
+                                     screenshot_end_x.load(), screenshot_end_y.load(), 48);
             } else if (drawing_active.load() && drawing_start_x.load() != -1) {
                 const int mx = GET_X_LPARAM(lParam);
                 const int my = GET_Y_LPARAM(lParam);
@@ -4545,12 +5350,23 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Modo dibujo - mostrar preview
                 end_x.store(mx);
                 end_y.store(my);
-                RequestOverlayRedraw();
+                // El lapiz acumula trazo: el resto ya esta en el back buffer, solo
+                // hace falta repintar alrededor del punto nuevo. Las demas
+                // herramientas son bandas elasticas ancladas al punto inicial.
+                if (current_drawing_tool.load() == DrawingTool::Pen) {
+                    RequestPreviewRedraw(mx, my, mx, my,
+                                         drawing_thickness.load() * 2 + 16);
+                } else {
+                    RequestPreviewRedraw(drawing_start_x.load(), drawing_start_y.load(),
+                                         mx, my, drawing_thickness.load() * 4 + 16);
+                }
             } else if (selection_mode.load() && start_x.load() != -1 && !drawing_active.load()) {
                 // Solo permitir selección si no hay herramienta de dibujo activa
                 end_x.store(GET_X_LPARAM(lParam));
                 end_y.store(GET_Y_LPARAM(lParam));
-                RequestOverlayRedraw();
+                RequestPreviewRedraw(start_x.load(), start_y.load(),
+                                     end_x.load(), end_y.load(),
+                                     region_border_thickness.load() * 2 + 16);
             }
             break;
             
@@ -4815,55 +5631,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         }
 
         case WM_KEYDOWN:
-            // Manejar teclas F1-F5 para herramientas de dibujo (siempre disponibles)
-            if (wParam == VK_F1) {
-                // F1 - Activar herramienta Línea
-                current_drawing_tool.store(DrawingTool::Line);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            } else if (wParam == VK_F2) {
-                // F2 - Activar herramienta Flecha
-                current_drawing_tool.store(DrawingTool::Arrow);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            } else if (wParam == VK_F3) {
-                // F3 - Activar herramienta Rectángulo
-                current_drawing_tool.store(DrawingTool::Rectangle);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            // F4 (Texto) eliminado
-            } else if (wParam == VK_F4) {
-                // F4 - Activar herramienta Resaltador
-                current_drawing_tool.store(DrawingTool::Highlighter);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            } else if (wParam == VK_F5) {
-                // F5 - Elipse
-                current_drawing_tool.store(DrawingTool::Ellipse);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            } else if (wParam == VK_F6) {
-                // F6 - Lapiz (trazo libre)
-                current_drawing_tool.store(DrawingTool::Pen);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            } else if (wParam == VK_F7) {
-                // F7 - Pixelar (ocultar informacion sensible)
-                current_drawing_tool.store(DrawingTool::Redact);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
-                return 0;
-            } else if (wParam == VK_F8) {
-                // F8 - Numero de paso
-                current_drawing_tool.store(DrawingTool::Step);
-                drawing_active.store(true);
-                RequestOverlayRedraw();
+            // Atajos configurables de herramienta y de la leyenda (kToolHotkeys).
+            if (HandleConfigurableHotkey(wParam)) {
                 return 0;
             } else if (wParam == VK_ESCAPE) {
                 if (screenshot_mode.load()) {
@@ -4931,44 +5700,15 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Mantener para compatibilidad pero no hacer nada
                 LogDebug("ℹ️ Ctrl+Enter disabled - use Shift+Alt+X when overlay is active\n");
                 return 0;
-            } else if (wParam == 'T' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-                // Ctrl+T para activar modo texto (con o sin zoom)
+            } else if (wParam == static_cast<WPARAM>(hotkey_tool_text.load()) &&
+                       (GetKeyState(VK_CONTROL) & 0x8000)) {
+                // Ctrl + tecla de texto: activa el modo texto (con o sin zoom)
                 text_input_mode.store(true);
                 RequestOverlayRedraw();
             } else if (text_input_mode.load()) {
-                // Manejo de texto cuando está en modo edición
-                // Las teclas F1-F5 también funcionan en modo texto para herramientas de dibujo
-                if (wParam == VK_F1) {
-                    // F1 - Activar herramienta Línea
-                    current_drawing_tool.store(DrawingTool::Line);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    RequestOverlayRedraw();
-                    return 0;
-                } else if (wParam == VK_F2) {
-                    // F2 - Activar herramienta Flecha
-                    current_drawing_tool.store(DrawingTool::Arrow);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    RequestOverlayRedraw();
-                    return 0;
-                } else if (wParam == VK_F3) {
-                    // F3 - Activar herramienta Rectángulo
-                    current_drawing_tool.store(DrawingTool::Rectangle);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    RequestOverlayRedraw();
-                    return 0;
-                // F4 (Texto) eliminado
-                } else if (wParam == VK_F4) {
-                    // F4 - Activar herramienta Resaltador
-                    current_drawing_tool.store(DrawingTool::Highlighter);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    RequestOverlayRedraw();
-                    return 0;
-                }
-                
+                // Manejo de texto cuando está en modo edición.
+                // Los atajos de herramienta ya los resolvio
+                // HandleConfigurableHotkey antes de llegar aqui.
                 switch (wParam) {
                     case VK_RETURN:
                         // Enter para salto de línea
@@ -5938,27 +6678,27 @@ void UpdateSettingsLabels(HWND hwnd) {
     HWND hBorderLabel = GetDlgItem(hwnd, 1010);
     
     if (hOpacityLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(overlay_opacity.load());
+        std::wstring text = L"Value: " + std::to_wstring(overlay_opacity.load());
         SetWindowTextW(hOpacityLabel, text.c_str());
     }
     
     if (hZoomMinLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(zoom_min_factor.load() / 100.0f) + L"x";
+        std::wstring text = L"Value: " + std::to_wstring(zoom_min_factor.load() / 100.0f) + L"x";
         SetWindowTextW(hZoomMinLabel, text.c_str());
     }
     
     if (hZoomMaxLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(zoom_max_factor.load() / 100.0f) + L"x";
+        std::wstring text = L"Value: " + std::to_wstring(zoom_max_factor.load() / 100.0f) + L"x";
         SetWindowTextW(hZoomMaxLabel, text.c_str());
     }
     
     if (hCursorLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(text_cursor_blink_speed.load()) + L"ms";
+        std::wstring text = L"Value: " + std::to_wstring(text_cursor_blink_speed.load()) + L"ms";
         SetWindowTextW(hCursorLabel, text.c_str());
     }
     
     if (hBorderLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(region_border_thickness.load()) + L"px";
+        std::wstring text = L"Value: " + std::to_wstring(region_border_thickness.load()) + L"px";
         SetWindowTextW(hBorderLabel, text.c_str());
     }
 }
@@ -6095,33 +6835,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     
                 case MENU_ENABLE_AUTOSTART_ID: // Habilitar Auto-Inicio
                     LogDebug("🚀 Enabling auto-start on login...\n");
+                    // Se levanta la marca antes de actuar: aunque el registro
+                    // falle, el proximo arranque volvera a intentarlo.
+                    autostart_user_disabled.store(0);
+                    SaveConfiguration();
                     if (EnableAutoStart()) {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Auto-start enabled successfully.\n\n"
                             L"The application will run automatically every time you log into Windows.",
-                            L"Auto-Start Enabled", 
+                            L"Auto-Start Enabled",
                             MB_OK | MB_ICONINFORMATION);
                     } else {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Error enabling auto-start.\n\n"
                             L"Please verify that you have administrator privileges.",
-                            L"Error", 
+                            L"Error",
                             MB_OK | MB_ICONERROR);
                     }
                     break;
-                    
+
                 case MENU_DISABLE_AUTOSTART_ID: // Deshabilitar Auto-Inicio
                     LogDebug("🚫 Disabling auto-start on login...\n");
+                    // Sin esta marca el propio arranque siguiente volveria a
+                    // registrar el auto-inicio y desharia la decision.
+                    autostart_user_disabled.store(1);
+                    SaveConfiguration();
                     if (DisableAutoStart()) {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Auto-start disabled successfully.\n\n"
                             L"The application will no longer run automatically when logging in.",
-                            L"Auto-Start Disabled", 
+                            L"Auto-Start Disabled",
                             MB_OK | MB_ICONINFORMATION);
                     } else {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Error disabling auto-start.",
-                            L"Error", 
+                            L"Error",
                             MB_OK | MB_ICONERROR);
                     }
                     break;
@@ -6266,33 +7014,36 @@ void ShowAutoStartStatus() {
     bool isAdmin = IsRunningAsAdministrator();
     LogDebug("👤 Administrator privileges: %s\n", isAdmin ? "✅ YES" : "❌ NO");
     
-    // Verificar si está habilitado
-    bool isEnabled = IsAutoStartEnabled();
-    LogDebug("🚀 Auto-start enabled: %s\n", isEnabled ? "✅ YES" : "❌ NO");
-    
-    // Mostrar información del registro
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_READ, &hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        LogDebug("📋 Clave del registro: ✅ Accesible\n");
-        
-        if (isEnabled) {
+    // Desglose por mecanismo: la tarea programada es la que realmente arranca la
+    // aplicacion elevada, la entrada del registro es solo el respaldo.
+    bool taskEnabled = IsScheduledTaskAutoStartEnabled();
+    LogDebug("🗓️ Tarea programada '%ls': %s\n", AUTOSTART_TASK_NAME,
+             taskEnabled ? "✅ REGISTRADA" : "❌ AUSENTE");
+
+    bool registryEnabled = IsRegistryAutoStartEnabled();
+    LogDebug("📋 Entrada HKCU\\...\\Run: %s\n",
+             registryEnabled ? "✅ PRESENTE" : "❌ AUSENTE");
+
+    LogDebug("🚀 Auto-start enabled: %s\n",
+             (taskEnabled || registryEnabled) ? "✅ YES" : "❌ NO");
+    LogDebug("🙋 Desactivado por el usuario: %s\n",
+             autostart_user_disabled.load() != 0 ? "✅ SI" : "❌ NO");
+
+    // Ruta registrada en el respaldo del registro, para detectar un .exe movido.
+    if (registryEnabled) {
+        HKEY hKey;
+        LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                    0, KEY_READ, &hKey);
+        if (result == ERROR_SUCCESS) {
             wchar_t valueData[MAX_PATH];
             DWORD dataSize = sizeof(valueData);
             DWORD dataType = REG_SZ;
-            
-            result = RegQueryValueExW(hKey, L"Screen Highlighter", NULL, &dataType, 
-                                     (LPBYTE)valueData, &dataSize);
-            
+
+            result = RegQueryValueExW(hKey, AUTOSTART_REGISTRY_VALUE, NULL,
+                                      &dataType, (LPBYTE)valueData, &dataSize);
             if (result == ERROR_SUCCESS) {
                 LogDebug("📁 Ruta en el registro: %ls\n", valueData);
-                
-                // Verificar si el archivo existe
-                DWORD fileAttributes = GetFileAttributesW(valueData);
-                if (fileAttributes != INVALID_FILE_ATTRIBUTES) {
+                if (GetFileAttributesW(valueData) != INVALID_FILE_ATTRIBUTES) {
                     LogDebug("✅ Archivo ejecutable: Existe y es accesible\n");
                 } else {
                     LogDebug("❌ Archivo ejecutable: No existe o no es accesible\n");
@@ -6300,13 +7051,12 @@ void ShowAutoStartStatus() {
             } else {
                 LogDebug("❌ Error al leer valor del registro: %ld\n", result);
             }
+            RegCloseKey(hKey);
+        } else {
+            LogDebug("📋 Clave del registro: ❌ No accesible (Error: %ld)\n", result);
         }
-        
-        RegCloseKey(hKey);
-    } else {
-        LogDebug("📋 Clave del registro: ❌ No accesible (Error: %ld)\n", result);
     }
-    
+
     // Mostrar ruta actual del ejecutable
     wchar_t currentExePath[MAX_PATH];
     if (GetModuleFileNameW(NULL, currentExePath, MAX_PATH) > 0) {
@@ -6439,7 +7189,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LogDebug("🔧 Agregando icono al system tray...\n");
     if (!AddToSystemTray()) {
         LogDebug("❌ Error al agregar icono al system tray\n");
-        MessageBoxW(NULL, L"Error al agregar icono al system tray", L"Error", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"Could not add the system tray icon", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
     LogDebug("✅ Icono agregado al system tray\n");
@@ -6448,21 +7198,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LogDebug("🔧 Registrando hotkeys...\n");
     if (!RegisterHotkeys()) {
         LogDebug("❌ Error al registrar hotkeys\n");
-        MessageBoxW(NULL, L"Error al registrar hotkeys", L"Error", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"Could not register the hotkeys", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
     LogDebug("✅ Hotkeys registrados\n");
     
-    // Verificar estado de auto-ejecución
-    if (IsAutoStartEnabled()) {
-        LogDebug("🚀 Auto-start on login: ENABLED\n");
-    } else {
-        LogDebug("🚫 Auto-start on login: DISABLED\n");
-    }
-    
-    // Mostrar estado detallado del auto-inicio
-    ShowAutoStartStatus();
-    
+    // Asegurar que la aplicación arranca con Windows.
+    // Va en un hilo aparte porque consulta y registra la tarea programada
+    // lanzando schtasks.exe, y eso retrasaria el arranque unas decimas de
+    // segundo. El hilo no toca ventanas ni recursos GDI, solo el registro y el
+    // planificador de tareas, asi que puede sobrevivir por su cuenta.
+    LogDebug("🔧 Configurando auto-inicio con Windows...\n");
+    std::thread([]() {
+        EnsureAutoStartConfigured();
+#ifdef DEBUG_BUILD
+        // Solo aporta con LogDebug activo: en release volveria a lanzar
+        // schtasks para escribir en el vacio.
+        ShowAutoStartStatus();
+#endif
+    }).detach();
+
     // Iniciar monitoreo de explorer.exe para restauración automática del system tray
     LogDebug("🔍 Iniciando monitoreo de explorer.exe...\n");
     StartExplorerMonitoring();
