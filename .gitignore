@@ -54,3 +54,7 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 *.cmake
+# Directorios de salida de MSVC
+Release/
+Debug/
+x64/

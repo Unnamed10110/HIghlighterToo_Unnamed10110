@@ -1,12 +1,26 @@
 // Archivo de recursos de Windows para Screen Highlighter
-// Icono principal de la aplicación
 
-IDI_ICON1 ICON "misc01.ico"
+// Sin este include, VS_VERSION_INFO e IDI_ICON1 son identificadores no definidos
+// y el compilador de recursos les asigna 0. Un recurso VERSIONINFO con ID 0 SI
+// queda incrustado en el binario, pero Windows busca la version en el ID 1, por
+// lo que las propiedades del archivo aparecian vacias pese a que resources.rc
+// declaraba empresa, descripcion y version.
+#include <winresrc.h>
+
+// Icono principal de la aplicación. ID 1: el icono de menor ID es el que Windows
+// usa para el ejecutable en el explorador y la barra de tareas.
+1 ICON "misc01.ico"
+
+// Manifiesto de la aplicacion (permisos de administrador, estilos visuales, DPI).
+// Necesario para MinGW: CMake solo agrega el manifiesto via target_sources con MSVC,
+// por lo que sin esta entrada el binario de MinGW se generaba SIN manifiesto.
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+1 24 "admin_manifest.manifest"
 
 // Información de versión
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 2,0,0,0
+PRODUCTVERSION 2,0,0,0
 FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
 FILEFLAGS 0x1L
@@ -23,12 +37,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Unnamed10110"
             VALUE "FileDescription", "Screen Highlighter - Screen Capture and Annotation Tool"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", "2.0.0.0"
             VALUE "InternalName", "ScreenHighlighter.exe"
             VALUE "LegalCopyright", "Copyright (C) 2025 Unnamed10110"
             VALUE "OriginalFilename", "ScreenHighlighter.exe"
             VALUE "ProductName", "Screen Highlighter"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", "2.0.0.0"
         END
     END
     BLOCK "VarFileInfo"

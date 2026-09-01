@@ -16,17 +16,75 @@
 #include <stdexcept>
 #include <optional>
 #include <unordered_map>
+#include <mutex>
+#include <cstdarg>
 #include <expected>
 // Headers para soporte de GIFs
 #include <gdiplus.h>
 #include <objidl.h>
 #include <shlwapi.h>
 
+// windows.h define macros min/max que rompen std::min / std::max.
+// NOMINMAX las desactiva. Tambien se define en CMakeLists, esto es un respaldo
+// por si se compila main.cpp directamente.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 // Optimizaciones de compilador para máxima performance
 // Nota: Los pragmas específicos de MSVC no son compatibles con g++
 
 // Incluir librería de controles comunes para sliders
 // #pragma comment(lib, "comctl32.lib") // No soportado por g++
+
+// ============================================================================
+// DIAGNOSTICO
+// ============================================================================
+// El binario que se distribuye es una aplicacion GUI sin consola, por lo que los
+// LogDebug() que habia repartidos por el archivo escribian a un stdout invalido:
+// no habia diagnostico util en la compilacion que realmente se usa.
+//
+// LogDebug envia el mensaje al depurador (visible con DebugView o desde el IDE)
+// en compilaciones de depuracion, y desaparece por completo en release.
+#ifdef DEBUG_BUILD
+inline void LogDebug(const char* format, ...) {
+    char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, format, args);
+    va_end(args);
+    OutputDebugStringA(buffer);
+}
+#else
+inline void LogDebug(const char*, ...) {}
+#endif
+
+// ============================================================================
+// CICLO DE VIDA DE GDI+
+// ============================================================================
+// GDI+ se inicializa una sola vez en WinMain y se cierra al salir. Antes se
+// inicializaba de forma diferida dentro de LoadGifFromFile y nunca se llamaba a
+// GdiplusShutdown. Se usa para decodificar GIFs y para codificar PNG.
+static ULONG_PTR g_gdiplusToken = 0;
+static bool g_gdiplusReady = false;
+
+bool InitializeGdiPlus() {
+    if (g_gdiplusReady) return true;
+    Gdiplus::GdiplusStartupInput input;
+    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, NULL) != Gdiplus::Ok) {
+        return false;
+    }
+    g_gdiplusReady = true;
+    return true;
+}
+
+void ShutdownGdiPlus() {
+    if (g_gdiplusReady) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusReady = false;
+        g_gdiplusToken = 0;
+    }
+}
 
 // ============================================================================
 // CLASES RAII OPTIMIZADAS PARA GESTIÓN SEGURA DE RECURSOS GDI
@@ -49,16 +107,43 @@ namespace GdiCache {
     static HBRUSH hSelectionBrush = nullptr;
     static HBRUSH hOverlayBrush = nullptr;
     
+    // Origen cacheado para AlphaBlend: un DIB de 1x1 y 32 bpp cuyo pixel se
+    // reescribe con el color pedido y se estira al tamaño del rectangulo. Evita
+    // crear y destruir un bitmap por cada trazo del resaltador.
+    static HDC hBlendDC = nullptr;
+    static HBITMAP hBlendBitmap = nullptr;
+    static DWORD* pBlendPixel = nullptr;
+
     // Lápices cacheados para colores comunes
     static HPEN hWhitePen = nullptr;
     static HPEN hCursorPen = nullptr;
     static HPEN hModernPen = nullptr;
     
-    // Cache para mediciones de texto (optimización de performance)
-    static std::unordered_map<std::wstring, SIZE> textSizeCache;
+    // Cache de mediciones de texto.
+    //
+    // La clave incluye la fuente: antes solo era el texto, asi que una medicion
+    // hecha con una fuente se reutilizaba con otra y devolvia un ancho erroneo.
+    // El tamaño esta acotado porque al escribir se genera una entrada por cada
+    // prefijo del texto y antes no se descartaba ninguna.
+    struct TextSizeKey {
+        std::wstring text;
+        HFONT font;
+        bool operator==(const TextSizeKey& other) const {
+            return font == other.font && text == other.text;
+        }
+    };
+    struct TextSizeKeyHash {
+        size_t operator()(const TextSizeKey& k) const {
+            return std::hash<std::wstring>{}(k.text) ^
+                   (std::hash<void*>{}(reinterpret_cast<void*>(k.font)) << 1);
+        }
+    };
+    constexpr size_t kMaxCacheEntries = 512;
+    static std::unordered_map<TextSizeKey, SIZE, TextSizeKeyHash> textSizeCache;
     
-    // Cache para dimensiones de bitmaps (optimización de performance)
-    static std::unordered_map<HBITMAP, SIZE> bitmapSizeCache;
+    // NOTA: se elimino el cache de dimensiones de bitmaps. Estaba indexado por
+    // HBITMAP y GDI reutiliza los handles, por lo que un handle liberado y vuelto a
+    // asignar devolvia las dimensiones del bitmap anterior. GetObject() es barato.
     
     // Cache para layout de texto (optimización de performance)
     struct TextLayout {
@@ -99,7 +184,9 @@ namespace GdiCache {
         return lines;
     }
     
-    // Función optimizada para obtener layout de texto con cache
+    // NOTA: TextRender::BuildLayout es quien calcula el layout real (incluyendo
+    // altura de imagenes y GIFs) y se usa una sola vez por frame. Esta version
+    // simple queda por compatibilidad, pero no esta en el camino de dibujo.
     TextLayout GetTextLayoutCached(const std::wstring& text) {
         auto it = textLayoutCache.find(text);
         if (it != textLayoutCache.end()) {
@@ -116,36 +203,42 @@ namespace GdiCache {
             // El ancho máximo se calculará cuando sea necesario con GetTextSizeCached
         }
         
+        if (textLayoutCache.size() >= kMaxCacheEntries) {
+            textLayoutCache.clear();
+        }
         textLayoutCache[text] = layout;
         return layout;
     }
     
     // Función optimizada para obtener tamaño de texto con cache
     SIZE GetTextSizeCached(HDC hdc, const std::wstring& text) {
-        auto it = textSizeCache.find(text);
+        const TextSizeKey key{text, (HFONT)GetCurrentObject(hdc, OBJ_FONT)};
+
+        auto it = textSizeCache.find(key);
         if (it != textSizeCache.end()) {
             return it->second;
         }
-        
-        SIZE size;
-        GetTextExtentPoint32W(hdc, text.c_str(), text.length(), &size);
-        textSizeCache[text] = size;
+
+        SIZE size = {0, 0};
+        GetTextExtentPoint32W(hdc, text.c_str(), static_cast<int>(text.length()), &size);
+
+        // Descartar todo al llegar al limite. Politica simple, pero el cache se
+        // rellena en un frame y evita el crecimiento sin fin que habia antes.
+        if (textSizeCache.size() >= kMaxCacheEntries) {
+            textSizeCache.clear();
+        }
+        textSizeCache[key] = size;
         return size;
     }
     
-    // Función optimizada para obtener dimensiones de bitmap con cache
-    SIZE GetBitmapSizeCached(HBITMAP hBitmap) {
-        auto it = bitmapSizeCache.find(hBitmap);
-        if (it != bitmapSizeCache.end()) {
-            return it->second;
-        }
-        
+    // Dimensiones de un bitmap. Sin cache a proposito: ver la nota de
+    // bitmapSizeCache arriba. GetObject() es una consulta local muy barata.
+    SIZE GetBitmapSize(HBITMAP hBitmap) {
         BITMAP bm;
         SIZE size = {0, 0};
         if (GetObject(hBitmap, sizeof(BITMAP), &bm) > 0) {
             size.cx = bm.bmWidth;
             size.cy = bm.bmHeight;
-            bitmapSizeCache[hBitmap] = size;
         }
         return size;
     }
@@ -153,7 +246,6 @@ namespace GdiCache {
     // Limpiar cache de texto cuando sea necesario
     void ClearTextCache() {
         textSizeCache.clear();
-        bitmapSizeCache.clear();
         textLayoutCache.clear();
     }
     
@@ -191,6 +283,32 @@ namespace GdiCache {
         }
     };
     
+    // Cache de lapices por (color, grosor). Antes DrawLine creaba y destruia un
+    // HPEN en cada llamada, y DrawArrow llama a DrawLine tres veces por flecha,
+    // por cada elemento y por cada frame.
+    static std::unordered_map<uint64_t, HPEN> penCache;
+
+    HPEN GetPenCached(COLORREF color, int thickness) {
+        thickness = std::clamp(thickness, 1, 100);
+        const uint64_t key = (static_cast<uint64_t>(color) << 32) |
+                              static_cast<uint64_t>(static_cast<uint32_t>(thickness));
+
+        auto it = penCache.find(key);
+        if (it != penCache.end()) {
+            return it->second;
+        }
+
+        HPEN pen = CreatePen(PS_SOLID, thickness, color);
+        if (pen) {
+            if (penCache.size() >= 256) {
+                for (auto& entry : penCache) DeleteObject(entry.second);
+                penCache.clear();
+            }
+            penCache[key] = pen;
+        }
+        return pen;
+    }
+
     // Inicializar cache
     void InitializeCache() {
         if (!hCachedFontZoom) {
@@ -227,6 +345,31 @@ namespace GdiCache {
             hOverlayBrush = CreateSolidBrush(RGB(0, 0, 0));
         }
         
+        if (!hBlendDC) {
+            hBlendDC = CreateCompatibleDC(NULL);
+            if (hBlendDC) {
+                BITMAPINFO bi;
+                ZeroMemory(&bi, sizeof(bi));
+                bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth = 1;
+                bi.bmiHeader.biHeight = 1;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+
+                void* bits = nullptr;
+                hBlendBitmap = CreateDIBSection(hBlendDC, &bi, DIB_RGB_COLORS,
+                                                &bits, NULL, 0);
+                if (hBlendBitmap) {
+                    pBlendPixel = static_cast<DWORD*>(bits);
+                    SelectObject(hBlendDC, hBlendBitmap);
+                } else {
+                    DeleteDC(hBlendDC);
+                    hBlendDC = nullptr;
+                }
+            }
+        }
+
         if (!hWhitePen) {
             hWhitePen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
         }
@@ -250,6 +393,13 @@ namespace GdiCache {
         if (hSelectionBrush) { DeleteObject(hSelectionBrush); hSelectionBrush = nullptr; }
         if (hOverlayBrush) { DeleteObject(hOverlayBrush); hOverlayBrush = nullptr; }
         
+        if (hBlendBitmap) { DeleteObject(hBlendBitmap); hBlendBitmap = nullptr; }
+        if (hBlendDC) { DeleteDC(hBlendDC); hBlendDC = nullptr; }
+        pBlendPixel = nullptr;
+
+        for (auto& entry : penCache) DeleteObject(entry.second);
+        penCache.clear();
+
         if (hWhitePen) { DeleteObject(hWhitePen); hWhitePen = nullptr; }
         if (hCursorPen) { DeleteObject(hCursorPen); hCursorPen = nullptr; }
         if (hModernPen) { DeleteObject(hModernPen); hModernPen = nullptr; }
@@ -414,6 +564,30 @@ public:
     }
 };
 
+// Recorte de un DC con restauracion garantizada.
+//
+// El back buffer del overlay es persistente entre frames: si se sale de la
+// funcion de dibujado sin deshacer el recorte (por ejemplo por un return
+// temprano al fallar CreatePen), TODOS los frames siguientes quedarian
+// recortados a la zona de este, y el overlay pareceria congelado.
+class ScopedClipRegion {
+    HDC dc_;
+    HRGN rgn_;
+public:
+    ScopedClipRegion(HDC dc, const RECT& r)
+        : dc_(dc), rgn_(CreateRectRgn(r.left, r.top, r.right, r.bottom)) {
+        if (rgn_) SelectClipRgn(dc_, rgn_);
+    }
+    ~ScopedClipRegion() {
+        if (rgn_) {
+            SelectClipRgn(dc_, NULL);
+            DeleteObject(rgn_);
+        }
+    }
+    ScopedClipRegion(const ScopedClipRegion&) = delete;
+    ScopedClipRegion& operator=(const ScopedClipRegion&) = delete;
+};
+
 // Clase RAII para HBRUSH - gestión automática de pinceles
 class ScopedBrush {
     HBRUSH handle_;
@@ -575,105 +749,11 @@ public:
 // ============================================================================
 // UTILIDADES MODERNAS CON C++23
 // ============================================================================
-
-// Función para crear ventanas con manejo de errores moderno
-std::expected<HWND, std::string> CreateWindowSafe(
-    LPCWSTR lpClassName,
-    LPCWSTR lpWindowName,
-    DWORD dwStyle,
-    int X, int Y, int nWidth, int nHeight,
-    HWND hWndParent,
-    HMENU hMenu,
-    HINSTANCE hInstance,
-    LPVOID lpParam
-) {
-    HWND hwnd = CreateWindowW(lpClassName, lpWindowName, dwStyle, X, Y, 
-                              nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
-    
-    if (!hwnd) {
-        DWORD error = GetLastError();
-        return std::unexpected("Error al crear ventana: " + std::to_string(error));
-    }
-    
-    return hwnd;
-}
-
-// Función para cargar recursos con manejo de errores moderno
-template<typename ResourceType>
-std::expected<ResourceType, std::string> LoadResourceSafe(
-    HINSTANCE hInstance, 
-    LPCWSTR lpName, 
-    LPCWSTR lpType
-) {
-    HRSRC hRes = FindResourceW(hInstance, lpName, lpType);
-    if (!hRes) {
-        return std::unexpected("Recurso no encontrado");
-    }
-    
-    HGLOBAL hData = LoadResource(hInstance, hRes);
-    if (!hData) {
-        return std::unexpected("No se pudo cargar el recurso");
-    }
-    
-    ResourceType data = LockResource(hData);
-    if (!data) {
-        return std::unexpected("No se pudo bloquear el recurso");
-    }
-    
-    return data;
-}
-
-// Función para operaciones de archivo con manejo de errores moderno
-std::expected<std::string, std::string> ReadFileSafe(const std::wstring& filename) {
-    // Convertir wstring a string para compatibilidad con ifstream
-    std::string filename_str(filename.begin(), filename.end());
-    std::ifstream file(filename_str);
-    if (!file.is_open()) {
-        return std::unexpected("No se pudo abrir el archivo: " + filename_str);
-    }
-    
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
-}
-
-// Función para escribir archivos con manejo de errores moderno
-std::expected<void, std::string> WriteFileSafe(const std::wstring& filename, const std::string& content) {
-    // Convertir wstring a string para compatibilidad con ofstream
-    std::string filename_str(filename.begin(), filename.end());
-    std::ofstream file(filename_str);
-    if (!file.is_open()) {
-        return std::unexpected("No se pudo crear el archivo: " + filename_str);
-    }
-    
-    file << content;
-    if (file.fail()) {
-        return std::unexpected("Error al escribir en el archivo");
-    }
-    
-    return {};
-}
-
-// Función para operaciones de registro con manejo de errores moderno
-std::expected<std::wstring, std::string> ReadRegistryStringSafe(
-    HKEY hKey, 
-    LPCWSTR lpValueName
-) {
-    DWORD dataSize = 0;
-    LONG result = RegQueryValueExW(hKey, lpValueName, nullptr, nullptr, nullptr, &dataSize);
-    if (result != ERROR_SUCCESS) {
-        return std::unexpected("Error al consultar valor del registro: " + std::to_string(result));
-    }
-    
-    std::wstring data(dataSize / sizeof(wchar_t), L'\0');
-    result = RegQueryValueExW(hKey, lpValueName, nullptr, nullptr, 
-                             reinterpret_cast<LPBYTE>(&data[0]), &dataSize);
-    if (result != ERROR_SUCCESS) {
-        return std::unexpected("Error al leer valor del registro: " + std::to_string(result));
-    }
-    
-    return data;
-}
+// Aqui vivia una capa de ayudantes basados en std::expected (CreateWindowSafe,
+// LoadResourceSafe, ReadFileSafe, WriteFileSafe, ReadRegistryStringSafe). Nunca
+// se llamo a ninguno: solo existian sus definiciones. Se eliminaron por ser
+// codigo muerto. ReadFileSafe ademas contenia el mismo error de truncar wchar_t
+// a char que se corrigio en el guardado de capturas.
 
 // ============================================================================
 // ENUMERACIONES TIPO-SEGURAS PARA REEMPLAZAR MAGIC NUMBERS
@@ -686,7 +766,11 @@ enum class DrawingTool : uint8_t {
     Arrow = 2,
     Rectangle = 3,
     Text = 4,        // Mantenido para compatibilidad
-    Highlighter = 5
+    Highlighter = 5,
+    Ellipse = 6,
+    Pen = 7,         // trazo libre
+    Redact = 8,      // pixelar (ocultar informacion sensible)
+    Step = 9         // numero de paso
 };
 
 // Enumeración para tipos de mensajes personalizados
@@ -719,7 +803,10 @@ constexpr wchar_t MENU_EXIT_TEXT[] = L"Exit";
 constexpr wchar_t MENU_SEPARATOR_TEXT[] = L"";
 
 // Nombre del archivo de configuración
-constexpr const char* CONFIG_FILE = "ScreenHighlighter.ini";
+// Nombre del archivo de configuracion. La ruta completa la resuelve
+// GetConfigFilePath(): antes esta ruta era relativa y se resolvia contra el
+// directorio de trabajo, que al iniciar desde el registro (Run) es system32.
+constexpr const wchar_t* CONFIG_FILE_NAME = L"ScreenHighlighter.ini";
 
 // ============================================================================
 // VARIABLES GLOBALES CON MEJORAS DE SEGURIDAD
@@ -729,7 +816,9 @@ constexpr const char* CONFIG_FILE = "ScreenHighlighter.ini";
 std::atomic<bool> running(true);
 std::atomic<bool> overlay_active(false);
 std::atomic<bool> selection_mode(false);
-std::atomic<bool> needsRedraw(false);
+// La antigua bandera needsRedraw se elimino: el repintado ahora lo pide
+// RequestOverlayRedraw() via InvalidateRect y lo entrega WM_PAINT, en lugar de
+// que un bucle la consultara cada 16-50 ms.
 std::atomic<int> start_x(0);
 std::atomic<int> start_y(0);
 std::atomic<int> end_x(0);
@@ -754,6 +843,21 @@ std::atomic<int> text_selection_start(-1);
 std::atomic<int> text_selection_end(-1);
 std::atomic<bool> text_selection_active(false);
 // Sistema simple para manejar imágenes del clipboard
+// ----------------------------------------------------------------------------
+// Candado del estado de anotaciones.
+//
+// zoom_text, screenRectangles, drawing_elements, clipboard_images, image_markers
+// y gif_elements son objetos NO atomicos que se tocan desde tres hilos: el hilo
+// principal (WindowProc y el menu del tray), el hilo del overlay (ShowOverlay y
+// OverlayWndProc) y antes tambien un hilo suelto de parpadeo del cursor.
+//
+// Con -O0 cada acceso releia la memoria y las carreras parecian inofensivas; con
+// -O2 el compilador mantiene los valores en registros y los saca de los bucles, lo
+// que explica el sintoma conocido de "el modo Release no funciona". Todo acceso a
+// esas variables debe tomar este candado.
+// ----------------------------------------------------------------------------
+std::mutex g_annotationMutex;
+
 std::vector<ScopedBitmap> clipboard_images;
 std::vector<std::wstring> image_markers; // Marcadores en el texto
 
@@ -771,6 +875,28 @@ std::atomic<int> zoom_max_factor(500); // 5.0x = 500
 std::atomic<int> text_cursor_blink_speed(500); // ms
 std::atomic<int> region_border_thickness(2); // píxeles
 std::atomic<int> region_border_color(0x00FF00); // Verde por defecto
+// Opacidad del resaltador (1-255). 110 deja ver el contenido de abajo.
+std::atomic<int> highlighter_alpha(110);
+
+// Carpeta donde se guardan las capturas. Vacia = carpeta por defecto
+// (%USERPROFILE%\Pictures\Screenshots). Configurable desde el .ini.
+std::wstring screenshot_folder;
+// Formato de guardado: "png" (por defecto) o "bmp".
+std::wstring screenshot_format = L"png";
+
+// Leyenda de atajos de teclado del overlay. Se muestra por defecto porque los
+// atajos (F1-F8, Ctrl+T...) no estaban indicados en ninguna parte de la interfaz;
+// se alterna con F9 y la eleccion se recuerda en el .ini.
+std::atomic<bool> show_shortcut_legend(true);
+
+// La aplicacion se registra sola para arrancar con Windows en cada inicio. Este
+// valor recuerda que el usuario la desactivo a mano desde el menu del tray, para
+// no volver a activarla en su contra en el siguiente arranque.
+std::atomic<int> autostart_user_disabled(0);
+// Estado del auto-inicio ya consultado. Comprobarlo de verdad implica lanzar
+// schtasks.exe, demasiado lento para hacerlo cada vez que se abre el menu del
+// tray; el menu lee esta copia, que se refresca al arrancar y tras cada cambio.
+std::atomic<bool> autostart_active(false);
 
 // Modos de recursos
 enum class ResourceMode {
@@ -787,6 +913,110 @@ std::atomic<int> scroll_max(1000);  // Contenido total alto
 
 // Variables para herramientas de dibujo
 std::atomic<DrawingTool> current_drawing_tool{DrawingTool::None};
+
+// ============================================================================
+// ATAJOS DE HERRAMIENTA CONFIGURABLES
+// ============================================================================
+// Antes las herramientas estaban fijas en F1-F8. Ahora cada una tiene su tecla,
+// configurable desde el .ini, y los valores por defecto son letras mnemonicas.
+//
+// Al ser letras sueltas no pueden atenderse mientras se escribe texto: dentro
+// del modo texto solo se aceptan atajos que sean teclas de funcion (ver
+// ToolHotkeyAllowedWhileTyping).
+std::atomic<int> hotkey_tool_arrow('A');
+std::atomic<int> hotkey_tool_line('L');
+std::atomic<int> hotkey_tool_rectangle('R');
+std::atomic<int> hotkey_tool_highlighter('H');
+std::atomic<int> hotkey_tool_pixelate('B');
+std::atomic<int> hotkey_tool_step('S');
+// El usuario no fijo tecla para estas dos; se les asigna la inicial de su
+// nombre, siguiendo el mismo criterio que el resto.
+std::atomic<int> hotkey_tool_ellipse('E');
+std::atomic<int> hotkey_tool_pen('P');
+// Atajos que no seleccionan herramienta pero tambien se pueden reasignar.
+std::atomic<int> hotkey_tool_text('T');          // se usa con Ctrl
+std::atomic<int> hotkey_toggle_legend(VK_F9);
+
+struct ToolHotkey {
+    DrawingTool tool;
+    const char* iniKey;          // clave en el .ini
+    const wchar_t* label;        // nombre mostrado en la leyenda
+    std::atomic<int>* key;
+};
+
+// El orden es el que se muestra en la leyenda.
+const ToolHotkey kToolHotkeys[] = {
+    {DrawingTool::Arrow,       "hotkey_arrow",       L"Arrow",       &hotkey_tool_arrow},
+    {DrawingTool::Line,        "hotkey_line",        L"Line",        &hotkey_tool_line},
+    {DrawingTool::Rectangle,   "hotkey_rectangle",   L"Rectangle",   &hotkey_tool_rectangle},
+    {DrawingTool::Highlighter, "hotkey_highlight",   L"Highlight",   &hotkey_tool_highlighter},
+    {DrawingTool::Redact,      "hotkey_pixelate",    L"Pixelate",    &hotkey_tool_pixelate},
+    {DrawingTool::Step,        "hotkey_step_number", L"Step number", &hotkey_tool_step},
+    {DrawingTool::Ellipse,     "hotkey_ellipse",     L"Ellipse",     &hotkey_tool_ellipse},
+    {DrawingTool::Pen,         "hotkey_pen",         L"Pen",         &hotkey_tool_pen},
+};
+constexpr int kToolHotkeyCount =
+    static_cast<int>(sizeof(kToolHotkeys) / sizeof(kToolHotkeys[0]));
+
+// Las teclas de funcion no producen texto, asi que pueden seguir actuando como
+// atajo dentro del modo texto. Una letra, no.
+bool ToolHotkeyAllowedWhileTyping(int vk) {
+    return vk >= VK_F1 && vk <= VK_F24;
+}
+
+// Convierte el valor del .ini en un codigo de tecla virtual.
+// Acepta una letra o digito ("A", "7") y las teclas de funcion ("F1".."F24").
+// Devuelve fallback si el texto no es valido, para que un .ini editado a mano y
+// mal escrito no deje la herramienta sin atajo.
+int ParseHotkeyValue(const std::string& raw, int fallback) {
+    std::string text;
+    for (char c : raw) {
+        if (!isspace(static_cast<unsigned char>(c))) {
+            text += static_cast<char>(toupper(static_cast<unsigned char>(c)));
+        }
+    }
+    if (text.empty()) return fallback;
+
+    if (text.size() == 1) {
+        const char c = text[0];
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            return static_cast<int>(c);
+        }
+        return fallback;
+    }
+
+    if (text[0] == 'F') {
+        const std::string digits = text.substr(1);
+        if (!digits.empty() &&
+            digits.find_first_not_of("0123456789") == std::string::npos) {
+            const int n = std::atoi(digits.c_str());
+            if (n >= 1 && n <= 24) return VK_F1 + (n - 1);
+        }
+    }
+    return fallback;
+}
+
+// Nombre legible de una tecla, para el .ini y para la leyenda en pantalla.
+std::wstring HotkeyDisplayName(int vk) {
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        return L"F" + std::to_wstring(vk - VK_F1 + 1);
+    }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        return std::wstring(1, static_cast<wchar_t>(vk));
+    }
+    return L"?";
+}
+
+// Version estrecha para escribir en el .ini, que se guarda como texto ANSI.
+std::string HotkeyIniValue(int vk) {
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        return "F" + std::to_string(vk - VK_F1 + 1);
+    }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        return std::string(1, static_cast<char>(vk));
+    }
+    return "";
+}
 std::atomic<int> drawing_color(RGB(255, 0, 0)); // Color rojo por defecto
 std::atomic<int> drawing_thickness(3); // Grosor de línea
 std::atomic<bool> drawing_fill(false); // Relleno para formas
@@ -809,8 +1039,10 @@ struct DrawingElement {
     COLORREF color;
     int thickness;
     bool filled;
-    std::wstring text; // Para texto libre
-    
+    std::wstring text;           // Para texto libre
+    std::vector<POINT> points;   // Trazo del lapiz (DrawingTool::Pen)
+    int step_number = 0;         // Numero mostrado por DrawingTool::Step
+
     DrawingElement(DrawingTool type, int x1, int y1, int x2, int y2, COLORREF col, int thick, bool fill, const std::wstring& txt = L"")
         : tool_type(type), x1(x1), y1(y1), x2(x2), y2(y2), color(col), thickness(thick), filled(fill), text(txt) {}
 };
@@ -854,12 +1086,23 @@ struct GifElement {
 };
 
 std::vector<DrawingElement> drawing_elements;
+
+// Pila de rehacer. Ctrl+Z mueve el ultimo elemento aqui y Ctrl+Y / Ctrl+Shift+Z
+// lo devuelve. El README ya prometia "Undo/Redo" pero solo existia el deshacer.
+std::vector<DrawingElement> redo_stack;
+
+// Trazo del lapiz en curso (se acumula mientras el boton esta presionado).
+std::vector<POINT> pen_stroke;
+
+// Contador de los numeros de paso (DrawingTool::Step).
+std::atomic<int> step_counter(1);
 std::vector<GifElement> gif_elements; // Elementos GIF para reproducción
 
 // Variables para el system tray
 NOTIFYICONDATA nid;
 HWND hMainWnd;
-bool systemTrayInitialized = false;
+// Atomico: lo consulta y actualiza tambien el hilo monitor de explorer.exe.
+std::atomic<bool> systemTrayInitialized{false};
 // WM_TASKBAR ya está definido arriba
 
 // Variables para monitoreo de explorer.exe y restauración del system tray
@@ -886,73 +1129,54 @@ void ApplyResourceModeSettings() {
     
     switch (mode) {
         case ResourceMode::LowResources:
-            printf("🔋 Applying Low Resources Mode settings...\n");
+            LogDebug("🔋 Applying Low Resources Mode settings...\n");
             
-            // Limpiar caches para liberar memoria
+            // Liberar los caches de texto: es memoria recuperable y no es
+            // contenido del usuario.
             GdiCache::ClearTextCache();
             
-            // Reducir tamaños de pre-allocación
-            clipboard_images.clear();
-            clipboard_images.shrink_to_fit();
-            image_markers.clear();
-            image_markers.shrink_to_fit();
-            drawing_elements.clear();
-            drawing_elements.shrink_to_fit();
-            gif_elements.clear();
-            gif_elements.shrink_to_fit();
-            screenRectangles.clear();
-            screenRectangles.shrink_to_fit();
-            
-            // Pre-allocar con tamaños mínimos
-            clipboard_images.reserve(10);  // Reducido de 50
-            image_markers.reserve(10);     // Reducido de 50
-            drawing_elements.reserve(25);  // Reducido de 100
-            gif_elements.reserve(5);       // Reducido de 20
-            screenRectangles.reserve(5);   // Reducido de 20
+            // IMPORTANTE: aqui se llamaba a .clear() sobre drawing_elements,
+            // clipboard_images y gif_elements, es decir cambiar de "modo de
+            // recursos" borraba las anotaciones del usuario. Reservar capacidad
+            // nunca justifica perder datos, asi que solo se reserva.
+            clipboard_images.reserve(10);
+            image_markers.reserve(10);
+            drawing_elements.reserve(25);
+            gif_elements.reserve(5);
+            screenRectangles.reserve(5);
             
             // Configurar para menor uso de CPU
             text_cursor_blink_speed.store(750); // Más lento
             
-            printf("✅ Low Resources Mode applied\n");
+            LogDebug("✅ Low Resources Mode applied\n");
             break;
             
         case ResourceMode::HighPerformance:
-            printf("⚡ Applying High Performance Mode settings...\n");
+            LogDebug("⚡ Applying High Performance Mode settings...\n");
             
-            // Pre-allocar con tamaños generosos
-            clipboard_images.clear();
-            clipboard_images.shrink_to_fit();
-            image_markers.clear();
-            image_markers.shrink_to_fit();
-            drawing_elements.clear();
-            drawing_elements.shrink_to_fit();
-            gif_elements.clear();
-            gif_elements.shrink_to_fit();
-            screenRectangles.clear();
-            screenRectangles.shrink_to_fit();
-            
-            // Pre-allocar con tamaños máximos para mejor performance
-            clipboard_images.reserve(200);  // Aumentado de 50
-            image_markers.reserve(200);     // Aumentado de 50
-            drawing_elements.reserve(500);  // Aumentado de 100
-            gif_elements.reserve(50);       // Aumentado de 20
-            screenRectangles.reserve(100);  // Aumentado de 20
+            // Igual que en LowResources: no se borran las anotaciones del usuario,
+            // solo se reserva capacidad.
+            clipboard_images.reserve(200);
+            image_markers.reserve(200);
+            drawing_elements.reserve(500);
+            gif_elements.reserve(50);
+            screenRectangles.reserve(100);
             
             // Configurar para máximo rendimiento
             text_cursor_blink_speed.store(250); // Más rápido
             
-            printf("✅ High Performance Mode applied\n");
+            LogDebug("✅ High Performance Mode applied\n");
             break;
             
         case ResourceMode::Normal:
         default:
-            printf("🔧 Applying Normal Mode settings...\n");
+            LogDebug("🔧 Applying Normal Mode settings...\n");
             
             // Aplicar configuraciones estándar (las originales)
             PreAllocateVectors();
             text_cursor_blink_speed.store(500); // Velocidad normal
             
-            printf("✅ Normal Mode applied\n");
+            LogDebug("✅ Normal Mode applied\n");
             break;
     }
 }
@@ -966,12 +1190,166 @@ void PreAllocateVectors() {
     screenRectangles.reserve(20);  // Pre-allocar para hasta 20 rectángulos
 }
 
-// Variable global para el handle de la ventana overlay
-HWND hCurrentOverlay = NULL;
+// Handle de la ventana overlay. Atomico: lo escribe el hilo del overlay y lo
+// leen el hilo principal y DrawOverlay.
+std::atomic<HWND> hCurrentOverlay{nullptr};
+
+// ----------------------------------------------------------------------------
+// Geometria del escritorio virtual
+// ----------------------------------------------------------------------------
+// SM_CXSCREEN / SM_CYSCREEN describen SOLO el monitor primario. El escritorio
+// virtual abarca todos los monitores y su origen puede ser negativo (un monitor
+// a la izquierda o arriba del primario).
+int VirtualScreenLeft()   { return GetSystemMetrics(SM_XVIRTUALSCREEN); }
+int VirtualScreenTop()    { return GetSystemMetrics(SM_YVIRTUALSCREEN); }
+int VirtualScreenWidth()  { return GetSystemMetrics(SM_CXVIRTUALSCREEN); }
+int VirtualScreenHeight() { return GetSystemMetrics(SM_CYVIRTUALSCREEN); }
+
+// El overlay cubre todo el escritorio virtual, asi que sus coordenadas de cliente
+// estan desplazadas respecto a las de pantalla por el origen virtual.
+int ClientToScreenX(int clientX) { return clientX + VirtualScreenLeft(); }
+int ClientToScreenY(int clientY) { return clientY + VirtualScreenTop(); }
+
+// Habilita conciencia de DPI por monitor en tiempo de ejecucion.
+//
+// El manifiesto ya lo declara, pero se hace tambien aqui por si el binario se
+// ejecuta sin manifiesto incrustado. Se carga dinamicamente para no romper la
+// compatibilidad con Windows 7/8, donde estas funciones no existen.
+void EnablePerMonitorDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef BOOL (WINAPI *SetCtxFn)(void*);
+        SetCtxFn setCtx = (SetCtxFn)(void*)GetProcAddress(
+            user32, "SetProcessDpiAwarenessContext");
+        if (setCtx) {
+            // -4 == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            if (setCtx((void*)(INT_PTR)-4)) return;
+            // -3 == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
+            if (setCtx((void*)(INT_PTR)-3)) return;
+        }
+    }
+
+    // Respaldo para Windows 8.1 / 10 antiguos.
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    if (shcore) {
+        typedef HRESULT (WINAPI *SetAwarenessFn)(int);
+        SetAwarenessFn setAwareness = (SetAwarenessFn)(void*)GetProcAddress(
+            shcore, "SetProcessDpiAwareness");
+        if (setAwareness) {
+            setAwareness(2); // PROCESS_PER_MONITOR_DPI_AWARE
+            FreeLibrary(shcore);
+            return;
+        }
+        FreeLibrary(shcore);
+    }
+
+    // Ultimo respaldo (Vista+).
+    SetProcessDPIAware();
+}
+
+// Identificadores de los timers de la ventana overlay.
+constexpr UINT_PTR TIMER_CURSOR_BLINK = 1;  // parpadeo del cursor de texto
+constexpr UINT_PTR TIMER_GIF_FRAMES = 2;    // avance de frames de los GIFs
+
+// Pide un repintado del overlay.
+//
+// Reemplaza a needsRedraw.store(true): antes un bucle consultaba esa bandera cada
+// 16-50 ms; ahora se invalida la ventana y Windows entrega un WM_PAINT, por lo que
+// el hilo puede quedarse bloqueado en GetMessage cuando no hay nada que hacer.
+// bErase = FALSE porque WM_ERASEBKGND se ignora (se pinta con doble buffer).
+void RequestOverlayRedraw() {
+    HWND overlay = hCurrentOverlay.load();
+    if (overlay) {
+        InvalidateRect(overlay, NULL, FALSE);
+    }
+}
+
+// Invalida solo una zona en vez de la ventana entera.
+//
+// Repintar el escritorio virtual completo cuesta ~4,4 ms por frame en dos
+// monitores 1080p (1,5 ms de FillRect + 2,6 ms de BitBlt sobre 4,1 Mpx), y eso
+// se pagaba en CADA WM_MOUSEMOVE mientras se arrastra. Las rutas de alta
+// frecuencia usan esta variante; el resto sigue invalidando todo, que es lo
+// seguro cuando cambia el estado general del overlay.
+void RequestOverlayRedrawRect(const RECT& rect) {
+    HWND overlay = hCurrentOverlay.load();
+    if (overlay) {
+        InvalidateRect(overlay, &rect, FALSE);
+    }
+}
+
+// Vista previa que ocupaba el arrastre en el frame anterior. Al mover el raton
+// solo cambian la banda elastica vieja y la nueva, asi que basta con invalidar
+// la union de ambas.
+static RECT g_lastPreviewRect = {0, 0, 0, 0};
+static bool g_hasLastPreviewRect = false;
+
+void ResetPreviewRectTracking() {
+    g_hasLastPreviewRect = false;
+}
+
+// Invalida la banda elastica anterior y la actual. El margen cubre el grosor del
+// trazo y las puntas de flecha, que pintan fuera de las coordenadas nominales.
+void RequestPreviewRedraw(int x1, int y1, int x2, int y2, int pad) {
+    RECT current = {std::min(x1, x2), std::min(y1, y2),
+                    std::max(x1, x2), std::max(y1, y2)};
+    InflateRect(&current, pad, pad);
+
+    RECT dirty = current;
+    if (g_hasLastPreviewRect) {
+        UnionRect(&dirty, &current, &g_lastPreviewRect);
+    }
+    g_lastPreviewRect = current;
+    g_hasLastPreviewRect = true;
+
+    RequestOverlayRedrawRect(dirty);
+}
 
 // Función para cargar configuración desde archivo .ini
+// Devuelve la ruta absoluta del archivo de configuracion, en
+// %APPDATA%\ScreenHighlighter\. Se usa APPDATA y no la carpeta del ejecutable
+// porque la aplicacion corre elevada y puede estar instalada en Program Files,
+// donde la escritura falla.
+std::wstring GetConfigFilePath() {
+    static std::wstring cached;
+    if (!cached.empty()) return cached;
+
+    PWSTR appDataPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, NULL, &appDataPath))) {
+        std::wstring dir = std::wstring(appDataPath) + L"\\ScreenHighlighter";
+        CoTaskMemFree(appDataPath);
+        SHCreateDirectoryExW(NULL, dir.c_str(), NULL);
+        cached = dir + L"\\" + CONFIG_FILE_NAME;
+    } else {
+        // Respaldo: junto al ejecutable.
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        std::wstring exePathStr(exePath);
+        size_t lastSlash = exePathStr.find_last_of(L"\\/");
+        cached = exePathStr.substr(0, lastSlash + 1) + CONFIG_FILE_NAME;
+    }
+    return cached;
+}
+
+// Si existe un .ini de una version anterior junto al ejecutable y todavia no hay
+// uno en APPDATA, se copia para no perder la configuracion del usuario.
+void MigrateLegacyConfig() {
+    const std::wstring target = GetConfigFilePath();
+    if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring exePathStr(exePath);
+    size_t lastSlash = exePathStr.find_last_of(L"\\/");
+    const std::wstring legacy = exePathStr.substr(0, lastSlash + 1) + CONFIG_FILE_NAME;
+
+    if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        CopyFileW(legacy.c_str(), target.c_str(), TRUE);
+    }
+}
+
 void LoadConfiguration() {
-    std::ifstream file(CONFIG_FILE);
+    std::ifstream file(GetConfigFilePath().c_str());
     if (!file.is_open()) {
         // Si no existe el archivo, usar valores por defecto
         return;
@@ -1007,10 +1385,54 @@ void LoadConfiguration() {
                     region_border_color.store(std::stoi(value));
                 } else if (key == "hotkey_shift_alt_x") {
                     hotkey_shift_alt_x.store(std::stoi(value));
+                } else if (key == "drawing_color") {
+                    drawing_color.store(std::stoi(value));
+                } else if (key == "drawing_thickness") {
+                    drawing_thickness.store(std::clamp(std::stoi(value), 1, 50));
+                } else if (key == "drawing_fill") {
+                    drawing_fill.store(std::stoi(value) != 0);
+                } else if (key == "highlighter_alpha") {
+                    highlighter_alpha.store(std::clamp(std::stoi(value), 1, 255));
+                } else if (key == "screenshot_format") {
+                    screenshot_format = (value == "bmp") ? L"bmp" : L"png";
+                } else if (key == "screenshot_folder") {
+                    // El .ini se lee como texto estrecho; se convierte con la
+                    // pagina de codigos activa para soportar rutas con acentos.
+                    if (value.empty()) {
+                        screenshot_folder.clear();
+                    } else {
+                        int needed = MultiByteToWideChar(CP_ACP, 0, value.c_str(),
+                                                         -1, NULL, 0);
+                        if (needed > 0) {
+                            std::wstring wide(needed - 1, L'\0');
+                            MultiByteToWideChar(CP_ACP, 0, value.c_str(), -1,
+                                                &wide[0], needed);
+                            screenshot_folder = wide;
+                        }
+                    }
                 } else if (key == "resource_mode") {
                     int mode = std::stoi(value);
                     if (mode >= 0 && mode <= 2) {
                         current_resource_mode.store(static_cast<ResourceMode>(mode));
+                    }
+                } else if (key == "autostart_user_disabled") {
+                    autostart_user_disabled.store(std::stoi(value) != 0 ? 1 : 0);
+                } else if (key == "show_shortcut_legend") {
+                    show_shortcut_legend.store(std::stoi(value) != 0);
+                } else if (key == "hotkey_text") {
+                    hotkey_tool_text.store(
+                        ParseHotkeyValue(value, hotkey_tool_text.load()));
+                } else if (key == "hotkey_toggle_legend") {
+                    hotkey_toggle_legend.store(
+                        ParseHotkeyValue(value, hotkey_toggle_legend.load()));
+                } else {
+                    // Atajos de herramienta: la tabla evita repetir una rama por
+                    // cada una y mantener dos listas que se desincronizan.
+                    for (const ToolHotkey& hk : kToolHotkeys) {
+                        if (key == hk.iniKey) {
+                            hk.key->store(ParseHotkeyValue(value, hk.key->load()));
+                            break;
+                        }
                     }
                 }
             } catch (const std::exception&) {
@@ -1024,7 +1446,7 @@ void LoadConfiguration() {
 
 // Función para guardar configuración en archivo .ini
 void SaveConfiguration() {
-    std::ofstream file(CONFIG_FILE);
+    std::ofstream file(GetConfigFilePath().c_str());
     if (!file.is_open()) {
         return;
     }
@@ -1041,6 +1463,44 @@ void SaveConfiguration() {
     file << "region_border_color=" << region_border_color.load() << std::endl;
     file << "hotkey_shift_alt_x=" << hotkey_shift_alt_x.load() << std::endl;
     file << "resource_mode=" << static_cast<int>(current_resource_mode.load()) << std::endl;
+    file << "autostart_user_disabled=" << autostart_user_disabled.load() << std::endl;
+    file << "show_shortcut_legend=" << (show_shortcut_legend.load() ? 1 : 0) << std::endl;
+
+    // Atajos de cada herramienta. Se guardan con su nombre legible ("A", "F1")
+    // para que se puedan editar a mano sin consultar codigos de tecla virtual.
+    for (const ToolHotkey& hk : kToolHotkeys) {
+        file << hk.iniKey << "=" << HotkeyIniValue(hk.key->load()) << std::endl;
+    }
+    file << "hotkey_text=" << HotkeyIniValue(hotkey_tool_text.load()) << std::endl;
+    file << "hotkey_toggle_legend=" << HotkeyIniValue(hotkey_toggle_legend.load())
+         << std::endl;
+
+    // Estas cinco no se guardaban, por lo que el color, el grosor y el relleno
+    // elegidos por el usuario se perdian en cada reinicio.
+    file << "drawing_color=" << drawing_color.load() << std::endl;
+    file << "drawing_thickness=" << drawing_thickness.load() << std::endl;
+    file << "drawing_fill=" << (drawing_fill.load() ? 1 : 0) << std::endl;
+    file << "highlighter_alpha=" << highlighter_alpha.load() << std::endl;
+
+    // screenshot_format solo contiene "png" o "bmp", pero se convierte igual con
+    // la API en vez de truncar wchar_t a char, que es el patron que se corrigio
+    // en el resto del archivo.
+    file << "screenshot_format=" << (screenshot_format == L"bmp" ? "bmp" : "png")
+         << std::endl;
+
+    {
+        std::string narrowFolder;
+        if (!screenshot_folder.empty()) {
+            int needed = WideCharToMultiByte(CP_ACP, 0, screenshot_folder.c_str(),
+                                             -1, NULL, 0, NULL, NULL);
+            if (needed > 0) {
+                narrowFolder.resize(needed - 1);
+                WideCharToMultiByte(CP_ACP, 0, screenshot_folder.c_str(), -1,
+                                    &narrowFolder[0], needed, NULL, NULL);
+            }
+        }
+        file << "screenshot_folder=" << narrowFolder << std::endl;
+    }
     
     file.close();
 }
@@ -1095,6 +1555,9 @@ bool CheckClipboardForGif() {
 }
 
 // Función para agregar GIF desde el clipboard
+// Definida mas abajo, junto al resto del manejo de timers del overlay.
+void EnsureGifTimer();
+
 bool AddGifElement() {
     if (!OpenClipboard(NULL)) {
         return false;
@@ -1167,7 +1630,11 @@ bool AddGifElement() {
                             // El texto sube 8 líneas más (totalLines - 21)
                             // y el cursor queda sincronizado con el texto en la misma línea
                             
-                            needsRedraw.store(true);
+                            // Arrancar la animacion: ya no hay un bucle que
+                            // llame a UpdateGifFrames en cada iteracion.
+                            EnsureGifTimer();
+
+                            RequestOverlayRedraw();
                             success = true;
                             break; // Solo procesar el primer GIF
                         }
@@ -1184,17 +1651,9 @@ bool AddGifElement() {
 // Función para cargar GIF desde archivo
 std::expected<GifElement, std::string> LoadGifFromFile(const std::wstring& filePath, int x, int y) {
     try {
-        // Inicializar GDI+ si no está inicializado
-        static bool gdiplusInitialized = false;
-        static ULONG_PTR gdiplusToken;
-        
-        if (!gdiplusInitialized) {
-            Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-            Gdiplus::Status status = Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-            if (status != Gdiplus::Ok) {
-                return std::unexpected("No se pudo inicializar GDI+");
-            }
-            gdiplusInitialized = true;
+        // GDI+ ya fue inicializado por WinMain (InitializeGdiPlus).
+        if (!g_gdiplusReady) {
+            return std::unexpected("GDI+ no esta inicializado");
         }
         
         // Cargar imagen desde archivo
@@ -1383,7 +1842,7 @@ bool AddImageElement() {
                                         // El cursor está ahora en la posición correcta después de la imagen
                                         // y el texto tiene los saltos de línea necesarios para que esté debajo
                                         // Forzar redibujado para actualizar la posición del cursor
-                                        needsRedraw.store(true);
+                                        RequestOverlayRedraw();
                                         
                                         success = true;
                                     } else {
@@ -1436,7 +1895,7 @@ HICON LoadIconFromFile(int size) {
 
 // Función para agregar el icono al system tray
 bool AddToSystemTray() {
-    printf("  🖼️ Configuring system tray icon...\n");
+    LogDebug("  🖼️ Configuring system tray icon...\n");
     
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
@@ -1446,29 +1905,29 @@ bool AddToSystemTray() {
     nid.uCallbackMessage = WM_TASKBAR;
     
     // Cargar icono con gestión automática de memoria
-    printf("  🖼️ Cargando icono personalizado...\n");
+    LogDebug("  🖼️ Cargando icono personalizado...\n");
     ScopedIcon hIcon(LoadIconFromFile(TRAY_ICON_SMALL));
     if (!hIcon) {
         // Si falla la carga del icono, usar un icono por defecto del sistema
-        printf("  ⚠️ Usando icono por defecto del sistema\n");
+        LogDebug("  ⚠️ Usando icono por defecto del sistema\n");
         nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     } else {
-        printf("  ✅ Icono personalizado cargado\n");
+        LogDebug("  ✅ Icono personalizado cargado\n");
         nid.hIcon = hIcon.release(); // Transferir propiedad al nid
     }
     
     strcpy_s(nid.szTip, TRAY_TOOLTIP_TEXT);
-    printf("  💬 Tooltip configured: %s\n", TRAY_TOOLTIP_TEXT);
+    LogDebug("  💬 Tooltip configured: %s\n", TRAY_TOOLTIP_TEXT);
     
-    printf("  🔧 Agregando icono al system tray...\n");
+    LogDebug("  🔧 Agregando icono al system tray...\n");
     if (!Shell_NotifyIcon(NIM_ADD, &nid)) {
         // Manejar error de notificación
-        printf("  ❌ Error al agregar icono al system tray\n");
+        LogDebug("  ❌ Error al agregar icono al system tray\n");
         OutputDebugStringW(L"Error al agregar icono al system tray\n");
         return false;
     }
     
-    printf("  ✅ Icono agregado exitosamente al system tray\n");
+    LogDebug("  ✅ Icono agregado exitosamente al system tray\n");
     systemTrayInitialized = true;
     return true;
 }
@@ -1489,36 +1948,36 @@ void RemoveFromSystemTray() {
 
 // Función para restaurar el icono del system tray
 bool RestoreSystemTrayIcon() {
-    printf("🔄 Restaurando icono del system tray...\n");
+    LogDebug("🔄 Restaurando icono del system tray...\n");
     
     // Verificar si el icono ya está en el system tray
     if (systemTrayInitialized) {
         // Intentar restaurar el icono existente
         if (Shell_NotifyIcon(NIM_MODIFY, &nid)) {
-            printf("✅ Icono del system tray restaurado exitosamente\n");
+            LogDebug("✅ Icono del system tray restaurado exitosamente\n");
             return true;
         }
     }
     
     // Si no se puede restaurar, agregar uno nuevo
-    printf("🆕 Agregando nuevo icono al system tray...\n");
+    LogDebug("🆕 Agregando nuevo icono al system tray...\n");
     return AddToSystemTray();
 }
 
 // Función para monitorear el proceso explorer.exe
 void MonitorExplorerProcess() {
-    printf("🔍 Iniciando monitoreo de explorer.exe...\n");
+    LogDebug("🔍 Iniciando monitoreo de explorer.exe...\n");
     
     // Obtener el PID de explorer.exe
     HWND shellTrayWnd = FindWindowW(L"Shell_TrayWnd", NULL);
     if (shellTrayWnd) {
         GetWindowThreadProcessId(shellTrayWnd, &explorerProcessId);
-        printf("📱 Explorer.exe PID: %lu\n", explorerProcessId);
+        LogDebug("📱 Explorer.exe PID: %lu\n", explorerProcessId);
         
         if (explorerProcessId > 0) {
             explorerProcessHandle = OpenProcess(SYNCHRONIZE, FALSE, explorerProcessId);
             if (explorerProcessHandle) {
-                printf("✅ Monitoreo de explorer.exe iniciado\n");
+                LogDebug("✅ Monitoreo de explorer.exe iniciado\n");
                 
                 // Monitorear continuamente
                 while (explorerMonitorRunning.load()) {
@@ -1527,7 +1986,7 @@ void MonitorExplorerProcess() {
                     
                     if (waitResult == WAIT_OBJECT_0) {
                         // Explorer.exe terminó
-                        printf("⚠️ Explorer.exe terminated - Restoring system tray...\n");
+                        LogDebug("⚠️ Explorer.exe terminated - Restoring system tray...\n");
                         systemTrayRestorationNeeded.store(true);
                         
                         // Esperar a que explorer.exe se reinicie
@@ -1535,9 +1994,9 @@ void MonitorExplorerProcess() {
                         
                         // Restaurar el icono del system tray
                         if (RestoreSystemTrayIcon()) {
-                            printf("✅ System tray restored after explorer.exe restart\n");
+                            LogDebug("✅ System tray restored after explorer.exe restart\n");
                         } else {
-                            printf("❌ Error al restaurar system tray\n");
+                            LogDebug("❌ Error al restaurar system tray\n");
                         }
                         
                         // Reiniciar el monitoreo
@@ -1552,7 +2011,7 @@ void MonitorExplorerProcess() {
                             if (explorerProcessId > 0) {
                                 explorerProcessHandle = OpenProcess(SYNCHRONIZE, FALSE, explorerProcessId);
                                 if (explorerProcessHandle) {
-                                    printf("✅ Monitoreo de explorer.exe reiniciado\n");
+                                    LogDebug("✅ Monitoreo de explorer.exe reiniciado\n");
                                 }
                             }
                         }
@@ -1564,9 +2023,9 @@ void MonitorExplorerProcess() {
                         if (systemTrayInitialized) {
                             // Enviar mensaje de prueba al system tray
                             if (!Shell_NotifyIcon(NIM_MODIFY, &nid)) {
-                                printf("⚠️ Icono del system tray no responde - Restaurando...\n");
+                                LogDebug("⚠️ Icono del system tray no responde - Restaurando...\n");
                                 if (RestoreSystemTrayIcon()) {
-                                    printf("✅ System tray restaurado\n");
+                                    LogDebug("✅ System tray restaurado\n");
                                 }
                             }
                         }
@@ -1581,23 +2040,23 @@ void MonitorExplorerProcess() {
         }
     }
     
-    printf("🔍 Monitoreo de explorer.exe terminado\n");
+    LogDebug("🔍 Monitoreo de explorer.exe terminado\n");
 }
 
 // Función para iniciar el monitoreo de explorer.exe
 void StartExplorerMonitoring() {
     if (!explorerMonitorRunning.load()) {
-        printf("🚀 Iniciando monitoreo de explorer.exe...\n");
+        LogDebug("🚀 Iniciando monitoreo de explorer.exe...\n");
         explorerMonitorRunning.store(true);
         explorerMonitorThread = std::thread(MonitorExplorerProcess);
-        printf("✅ Monitoreo de explorer.exe iniciado\n");
+        LogDebug("✅ Monitoreo de explorer.exe iniciado\n");
     }
 }
 
 // Función para detener el monitoreo de explorer.exe
 void StopExplorerMonitoring() {
     if (explorerMonitorRunning.load()) {
-        printf("🛑 Deteniendo monitoreo de explorer.exe...\n");
+        LogDebug("🛑 Deteniendo monitoreo de explorer.exe...\n");
         explorerMonitorRunning.store(false);
         
         if (explorerMonitorThread.joinable()) {
@@ -1609,7 +2068,7 @@ void StopExplorerMonitoring() {
             explorerProcessHandle = NULL;
         }
         
-        printf("✅ Monitoreo de explorer.exe detenido\n");
+        LogDebug("✅ Monitoreo de explorer.exe detenido\n");
     }
 }
 
@@ -1617,143 +2076,417 @@ void StopExplorerMonitoring() {
 bool IsRunningAsAdministrator();
 void ShowAutoStartStatus();
 
-// Función para verificar si la aplicación está configurada para auto-ejecutarse
-bool IsAutoStartEnabled() {
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_READ, &hKey);
-    
-    if (result != ERROR_SUCCESS) {
-        printf("❌ Error opening registry key to verify auto-start: %ld\n", result);
+// ============================================================================
+// AUTO-INICIO CON WINDOWS
+// ============================================================================
+// La aplicacion pide privilegios de administrador en su manifiesto. Windows
+// ignora en silencio las entradas de HKCU\...\Run que apuntan a un ejecutable
+// elevado: al iniciar sesion no muestra el prompt de UAC y el programa
+// sencillamente no arranca. Por eso el mecanismo principal es una tarea
+// programada con RunLevel HighestAvailable, que si arranca elevada y sin
+// prompt. La entrada del registro se conserva solo como respaldo para el caso
+// en que schtasks.exe no este disponible (politicas de grupo restrictivas),
+// aunque en ese escenario el arranque seguira dependiendo de que el usuario
+// acepte el UAC.
+// ============================================================================
+
+constexpr const wchar_t* AUTOSTART_TASK_NAME = L"Screen Highlighter";
+constexpr const wchar_t* AUTOSTART_REGISTRY_VALUE = L"Screen Highlighter";
+constexpr const wchar_t* AUTOSTART_REGISTRY_KEY =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+// Ruta absoluta de schtasks.exe. Se resuelve desde el directorio de sistema y no
+// desde el PATH, que puede estar alterado.
+std::wstring GetSchTasksPath() {
+    wchar_t systemDir[MAX_PATH];
+    UINT len = GetSystemDirectoryW(systemDir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return L"schtasks.exe";
+    }
+    return std::wstring(systemDir) + L"\\schtasks.exe";
+}
+
+// Lanza un proceso sin consola visible y espera a que termine.
+// Devuelve true solo si el proceso arranco y salio con codigo 0.
+bool RunHiddenAndWait(const std::wstring& applicationPath,
+                      std::wstring commandLine,
+                      DWORD timeoutMs = 15000) {
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    // CreateProcessW puede escribir sobre lpCommandLine, de ahi que commandLine
+    // se reciba por valor: el buffer es propio y modificable.
+    if (!CreateProcessW(applicationPath.c_str(), &commandLine[0], NULL, NULL,
+                        FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        LogDebug("❌ No se pudo lanzar %ls: %ld\n", applicationPath.c_str(),
+                 GetLastError());
         return false;
     }
-    
+
+    DWORD exitCode = static_cast<DWORD>(-1);
+    if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+    } else {
+        LogDebug("⚠️ %ls no respondio en %lu ms; se termina\n",
+                 applicationPath.c_str(), timeoutMs);
+        TerminateProcess(pi.hProcess, 1);
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exitCode == 0;
+}
+
+// Escapa los caracteres que romperian el XML de la tarea. Las rutas de Windows
+// admiten '&' y comillas simples, asi que no es una precaucion teorica.
+std::wstring EscapeXml(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (wchar_t c : text) {
+        switch (c) {
+            case L'&':  out += L"&amp;";  break;
+            case L'<':  out += L"&lt;";   break;
+            case L'>':  out += L"&gt;";   break;
+            case L'"':  out += L"&quot;"; break;
+            case L'\'': out += L"&apos;"; break;
+            default:    out += c;         break;
+        }
+    }
+    return out;
+}
+
+// "DOMINIO\usuario", que es lo que espera el principal de la tarea. Se arma con
+// GetUserNameW mas %USERDOMAIN% para no enlazar Secur32 solo por GetUserNameEx.
+std::wstring GetCurrentUserSamName() {
+    // MAX_PATH (260) supera con holgura el maximo de un nombre de usuario (256).
+    wchar_t userName[MAX_PATH] = {};
+    DWORD userLen = MAX_PATH;
+    if (!GetUserNameW(userName, &userLen) || userName[0] == L'\0') {
+        LogDebug("❌ No se pudo obtener el nombre de usuario: %ld\n", GetLastError());
+        return L"";
+    }
+
+    wchar_t domain[MAX_PATH] = {};
+    DWORD domainLen = GetEnvironmentVariableW(L"USERDOMAIN", domain, MAX_PATH);
+    if (domainLen == 0 || domainLen >= MAX_PATH) {
+        // Sin USERDOMAIN se usa el nombre del equipo, que es el dominio efectivo
+        // de las cuentas locales.
+        DWORD computerLen = MAX_PATH;
+        if (!GetComputerNameW(domain, &computerLen)) {
+            return userName; // schtasks tambien acepta el nombre a secas
+        }
+    }
+
+    return std::wstring(domain) + L"\\" + userName;
+}
+
+// XML de la tarea programada. Se registra con /XML en vez de con los parametros
+// sueltos de schtasks porque /Create /SC ONLOGON no permite fijar el RunLevel ni
+// desactivar los limites de bateria, que son justamente lo que hace falta aqui.
+std::wstring BuildAutoStartTaskXml(const std::wstring& exePath,
+                                   const std::wstring& workingDir,
+                                   const std::wstring& userSamName) {
+    const std::wstring user = EscapeXml(userSamName);
+    return
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"  <RegistrationInfo>\r\n"
+        L"    <Description>Screen Highlighter - inicio automatico al abrir sesion.</Description>\r\n"
+        L"    <URI>\\" + EscapeXml(AUTOSTART_TASK_NAME) + L"</URI>\r\n"
+        L"  </RegistrationInfo>\r\n"
+        L"  <Triggers>\r\n"
+        L"    <LogonTrigger>\r\n"
+        L"      <Enabled>true</Enabled>\r\n"
+        L"      <UserId>" + user + L"</UserId>\r\n"
+        L"    </LogonTrigger>\r\n"
+        L"  </Triggers>\r\n"
+        L"  <Principals>\r\n"
+        L"    <Principal id=\"Author\">\r\n"
+        L"      <UserId>" + user + L"</UserId>\r\n"
+        L"      <LogonType>InteractiveToken</LogonType>\r\n"
+        // HighestAvailable es lo que evita el prompt de UAC al iniciar sesion.
+        L"      <RunLevel>HighestAvailable</RunLevel>\r\n"
+        L"    </Principal>\r\n"
+        L"  </Principals>\r\n"
+        L"  <Settings>\r\n"
+        L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        // Por defecto una tarea no arranca (y se detiene) con el equipo a
+        // bateria: en un portatil el programa no se iniciaria nunca desenchufado.
+        L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+        L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+        L"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+        L"    <StartWhenAvailable>false</StartWhenAvailable>\r\n"
+        L"    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+        L"    <IdleSettings>\r\n"
+        L"      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n"
+        L"      <RestartOnIdle>false</RestartOnIdle>\r\n"
+        L"    </IdleSettings>\r\n"
+        L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
+        L"    <Enabled>true</Enabled>\r\n"
+        L"    <Hidden>false</Hidden>\r\n"
+        L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+        L"    <WakeToRun>false</WakeToRun>\r\n"
+        // PT0S = sin limite. El valor por defecto (3 dias) mataria el proceso.
+        L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
+        L"    <Priority>7</Priority>\r\n"
+        L"  </Settings>\r\n"
+        L"  <Actions Context=\"Author\">\r\n"
+        L"    <Exec>\r\n"
+        L"      <Command>" + EscapeXml(exePath) + L"</Command>\r\n"
+        L"      <WorkingDirectory>" + EscapeXml(workingDir) + L"</WorkingDirectory>\r\n"
+        L"    </Exec>\r\n"
+        L"  </Actions>\r\n"
+        L"</Task>\r\n";
+}
+
+// Archivo temporal donde se deja el XML antes de pasarselo a schtasks.
+std::wstring CreateTempXmlPath() {
+    wchar_t tempDir[MAX_PATH];
+    DWORD len = GetTempPathW(MAX_PATH, tempDir);
+    if (len == 0 || len >= MAX_PATH) {
+        return L"";
+    }
+    wchar_t tempFile[MAX_PATH];
+    if (GetTempFileNameW(tempDir, L"shl", 0, tempFile) == 0) {
+        return L"";
+    }
+    return tempFile;
+}
+
+// schtasks /XML exige UTF-16 con BOM: sin la marca de orden interpreta el
+// archivo como ANSI y falla al parsear la declaracion XML.
+bool WriteUtf16FileWithBom(const std::wstring& path, const std::wstring& content) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LogDebug("❌ No se pudo crear %ls: %ld\n", path.c_str(), GetLastError());
+        return false;
+    }
+
+    const wchar_t bom = 0xFEFF;
+    DWORD written = 0;
+    bool ok = WriteFile(hFile, &bom, sizeof(bom), &written, NULL) &&
+              written == sizeof(bom);
+    if (ok) {
+        const DWORD bytes = static_cast<DWORD>(content.size() * sizeof(wchar_t));
+        ok = WriteFile(hFile, content.c_str(), bytes, &written, NULL) &&
+             written == bytes;
+    }
+    if (!ok) {
+        LogDebug("❌ Error escribiendo %ls: %ld\n", path.c_str(), GetLastError());
+    }
+
+    CloseHandle(hFile);
+    return ok;
+}
+
+// Ruta del ejecutable en ejecucion, o cadena vacia si no se puede determinar.
+std::wstring GetCurrentExePath() {
+    wchar_t exePath[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        LogDebug("❌ Error al obtener la ruta del ejecutable: %ld\n", GetLastError());
+        return L"";
+    }
+    return exePath;
+}
+
+bool IsScheduledTaskAutoStartEnabled() {
+    const std::wstring schtasks = GetSchTasksPath();
+    const std::wstring cmd = L"\"" + schtasks + L"\" /Query /TN \"" +
+                             AUTOSTART_TASK_NAME + L"\"";
+    return RunHiddenAndWait(schtasks, cmd, 10000);
+}
+
+bool EnableScheduledTaskAutoStart(const std::wstring& exePath) {
+    const std::wstring user = GetCurrentUserSamName();
+    if (user.empty()) {
+        return false;
+    }
+
+    std::wstring workingDir = exePath;
+    const size_t lastSlash = workingDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        workingDir = workingDir.substr(0, lastSlash);
+    }
+
+    const std::wstring xmlPath = CreateTempXmlPath();
+    if (xmlPath.empty()) {
+        LogDebug("❌ No se pudo crear el archivo temporal para el XML de la tarea\n");
+        return false;
+    }
+
+    bool ok = WriteUtf16FileWithBom(
+        xmlPath, BuildAutoStartTaskXml(exePath, workingDir, user));
+    if (ok) {
+        const std::wstring schtasks = GetSchTasksPath();
+        // /F sobrescribe la tarea existente, lo que hace la operacion idempotente
+        // y ademas corrige la ruta si el ejecutable cambio de carpeta.
+        const std::wstring cmd = L"\"" + schtasks + L"\" /Create /TN \"" +
+                                 AUTOSTART_TASK_NAME + L"\" /XML \"" + xmlPath +
+                                 L"\" /F";
+        ok = RunHiddenAndWait(schtasks, cmd);
+        LogDebug(ok ? "✅ Tarea programada de auto-inicio registrada\n"
+                    : "❌ schtasks no pudo registrar la tarea de auto-inicio\n");
+    }
+
+    DeleteFileW(xmlPath.c_str());
+    return ok;
+}
+
+bool DisableScheduledTaskAutoStart() {
+    if (!IsScheduledTaskAutoStartEnabled()) {
+        return true; // no existe: nada que borrar
+    }
+    const std::wstring schtasks = GetSchTasksPath();
+    const std::wstring cmd = L"\"" + schtasks + L"\" /Delete /TN \"" +
+                             AUTOSTART_TASK_NAME + L"\" /F";
+    return RunHiddenAndWait(schtasks, cmd);
+}
+
+bool IsRegistryAutoStartEnabled() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                0, KEY_READ, &hKey);
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error opening registry key to verify auto-start: %ld\n", result);
+        return false;
+    }
+
     wchar_t valueData[MAX_PATH];
     DWORD dataSize = sizeof(valueData);
     DWORD dataType = REG_SZ;
-    
-    // Verificar si existe el valor "Screen Highlighter"
-    result = RegQueryValueExW(hKey, L"Screen Highlighter", NULL, &dataType, 
-                             (LPBYTE)valueData, &dataSize);
-    
+    result = RegQueryValueExW(hKey, AUTOSTART_REGISTRY_VALUE, NULL, &dataType,
+                              (LPBYTE)valueData, &dataSize);
     RegCloseKey(hKey);
-    
+
     if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-start value found: %ls\n", valueData);
         return true;
-    } else if (result == ERROR_FILE_NOT_FOUND) {
-        printf("ℹ️ Auto-start value not found\n");
-        return false;
-    } else {
-        printf("❌ Error reading auto-start value: %ld\n", result);
+    } else if (result != ERROR_FILE_NOT_FOUND) {
+        LogDebug("❌ Error reading auto-start value: %ld\n", result);
+    }
+    return false;
+}
+
+bool EnableRegistryAutoStart(const std::wstring& exePath) {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                0, KEY_WRITE, &hKey);
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error opening registry key for auto-start: %ld\n", result);
         return false;
     }
+
+    result = RegSetValueExW(
+        hKey, AUTOSTART_REGISTRY_VALUE, 0, REG_SZ, (const BYTE*)exePath.c_str(),
+        static_cast<DWORD>((exePath.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error configuring auto-start in registry: %ld\n", result);
+        return false;
+    }
+    return true;
+}
+
+bool DisableRegistryAutoStart() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                0, KEY_WRITE, &hKey);
+    if (result != ERROR_SUCCESS) {
+        LogDebug("❌ Error opening registry key for auto-start: %ld\n", result);
+        return false;
+    }
+
+    result = RegDeleteValueW(hKey, AUTOSTART_REGISTRY_VALUE);
+    RegCloseKey(hKey);
+
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+}
+
+// Consulta real del estado, con el coste de lanzar schtasks. El menu del tray
+// usa autostart_active en su lugar.
+bool IsAutoStartEnabled() {
+    return IsScheduledTaskAutoStartEnabled() || IsRegistryAutoStartEnabled();
 }
 
 // Función para habilitar la auto-ejecución al iniciar sesión
 bool EnableAutoStart() {
-    printf("🔧 Attempting to enable auto-start...\n");
-    
-    // Verificar permisos de administrador
+    LogDebug("🔧 Attempting to enable auto-start...\n");
+
+    // Crear la tarea con RunLevel HighestAvailable requiere elevacion.
     if (!IsRunningAsAdministrator()) {
-        printf("❌ Administrator privileges required to configure auto-start\n");
+        LogDebug("❌ Administrator privileges required to configure auto-start\n");
         return false;
     }
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_WRITE, &hKey);
-    
-    if (result != ERROR_SUCCESS) {
-        printf("❌ Error opening registry key for auto-start: %ld\n", result);
+
+    const std::wstring exePath = GetCurrentExePath();
+    if (exePath.empty()) {
         return false;
     }
-    
-    // Obtener la ruta completa del ejecutable
-    wchar_t exePath[MAX_PATH];
-    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
-        printf("❌ Error al obtener ruta del ejecutable: %ld\n", GetLastError());
-        RegCloseKey(hKey);
+    if (GetFileAttributesW(exePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        LogDebug("❌ El archivo ejecutable no existe o no es accesible: %ld\n",
+                 GetLastError());
         return false;
     }
-    
-    printf("📁 Ruta del ejecutable: %ls\n", exePath);
-    
-    // Verificar que el archivo existe
-    DWORD fileAttributes = GetFileAttributesW(exePath);
-    if (fileAttributes == INVALID_FILE_ATTRIBUTES) {
-        printf("❌ El archivo ejecutable no existe o no es accesible: %ld\n", GetLastError());
-        RegCloseKey(hKey);
-        return false;
+    LogDebug("📁 Ruta del ejecutable: %ls\n", exePath.c_str());
+
+    if (EnableScheduledTaskAutoStart(exePath)) {
+        // Con la tarea en pie, una entrada en Run heredada de una version
+        // anterior solo serviria para intentar un segundo arranque.
+        DisableRegistryAutoStart();
+        autostart_active.store(true);
+        return true;
     }
-    
-    // Crear la entrada en el registro
-    result = RegSetValueExW(hKey, L"Screen Highlighter", 0, REG_SZ, 
-        (const BYTE*)exePath, (wcslen(exePath) + 1) * sizeof(wchar_t));
-    
-    RegCloseKey(hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-start enabled successfully in registry\n");
-        
-        // Verificar que se escribió correctamente
-        if (IsAutoStartEnabled()) {
-            printf("✅ Verification successful: auto-start is enabled\n");
-            return true;
-        } else {
-            printf("⚠️ Auto-start was written but cannot be verified\n");
-            return false;
-        }
-    } else {
-        printf("❌ Error configuring auto-start in registry: %ld\n", result);
-        return false;
+
+    LogDebug("⚠️ Sin tarea programada; se recurre a HKCU\\...\\Run (puede quedar "
+             "bloqueado por UAC al iniciar sesion)\n");
+    const bool ok = EnableRegistryAutoStart(exePath);
+    autostart_active.store(ok);
+    if (ok) {
+        LogDebug("✅ Auto-start enabled successfully in registry\n");
     }
+    return ok;
 }
 
 // Función para deshabilitar la auto-ejecución al iniciar sesión
 bool DisableAutoStart() {
-    printf("🔧 Attempting to disable auto-start...\n");
-    
-    // Verificar permisos de administrador
+    LogDebug("🔧 Attempting to disable auto-start...\n");
+
     if (!IsRunningAsAdministrator()) {
-        printf("❌ Administrator privileges required to configure auto-start\n");
+        LogDebug("❌ Administrator privileges required to configure auto-start\n");
         return false;
     }
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_WRITE, &hKey);
-    
-    if (result != ERROR_SUCCESS) {
-        printf("❌ Error opening registry key for auto-start: %ld\n", result);
-        return false;
+
+    // Se intentan los dos mecanismos aunque uno falle: dejar el otro activo
+    // haria que el programa siguiera arrancando solo.
+    const bool taskRemoved = DisableScheduledTaskAutoStart();
+    const bool registryRemoved = DisableRegistryAutoStart();
+    const bool ok = taskRemoved && registryRemoved;
+
+    autostart_active.store(ok ? false : IsAutoStartEnabled());
+    LogDebug(ok ? "✅ Auto-start disabled successfully\n"
+                : "❌ Error disabling auto-start\n");
+    return ok;
+}
+
+// Registra el auto-inicio en cada arranque, salvo que el usuario lo haya
+// desactivado a mano desde el tray. Volver a registrar es barato e idempotente,
+// y de paso reapunta la tarea si el ejecutable cambio de carpeta.
+void EnsureAutoStartConfigured() {
+    if (autostart_user_disabled.load() != 0) {
+        LogDebug("🚫 Auto-inicio desactivado por el usuario; no se reactiva\n");
+        autostart_active.store(IsAutoStartEnabled());
+        return;
     }
-    
-    // Eliminar la entrada del registro
-    result = RegDeleteValueW(hKey, L"Screen Highlighter");
-    
-    RegCloseKey(hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        printf("✅ Auto-start disabled successfully from registry\n");
-        
-        // Verificar que se eliminó correctamente
-        if (!IsAutoStartEnabled()) {
-            printf("✅ Verification successful: auto-start is disabled\n");
-            return true;
-        } else {
-            printf("⚠️ Auto-start was removed but cannot be verified\n");
-            return false;
-        }
-    } else if (result == ERROR_FILE_NOT_FOUND) {
-        printf("ℹ️ Auto-start was already disabled\n");
-        return true;
+
+    if (EnableAutoStart()) {
+        LogDebug("🚀 Auto-start on login: ENABLED\n");
     } else {
-        printf("❌ Error disabling auto-start from registry: %ld\n", result);
-        return false;
+        LogDebug("❌ No se pudo configurar el auto-inicio\n");
     }
 }
 
@@ -1786,7 +2519,9 @@ void ShowTrayMenu() {
     
     // Agregar opciones de auto-ejecución
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    if (IsAutoStartEnabled()) {
+    // Se lee la copia cacheada: consultar el estado real lanza schtasks.exe y el
+    // menu tardaria en abrirse.
+    if (autostart_active.load()) {
         AppendMenuW(hMenu, MF_STRING, MENU_DISABLE_AUTOSTART_ID, L"🚫 Disable Auto-Start");
     } else {
         AppendMenuW(hMenu, MF_STRING, MENU_ENABLE_AUTOSTART_ID, L"✅ Enable Auto-Start");
@@ -1803,18 +2538,27 @@ void ShowTrayMenu() {
     DestroyMenu(hMenu);
 }
 
+// Declaraciones adelantadas: CaptureScreenRegion redibuja las anotaciones sobre
+// la captura, y estas primitivas se definen mas abajo en este archivo.
+void DrawHighlighter(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color);
+void DrawEllipseShape(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color,
+                      int thickness, bool filled);
+void DrawPenStroke(HDC hdc, const std::vector<POINT>& points, COLORREF color,
+                   int thickness);
+void DrawStepMarker(HDC hdc, int x, int y, int number, COLORREF color, int thickness);
+void DrawRedaction(HDC hdcDest, HDC hdcSrc, int x1, int y1, int x2, int y2,
+                   int blockSize);
+
 // Función para dibujar línea (optimizada)
 void DrawLine(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thickness) {
-    ScopedPen hPen(CreatePen(PS_SOLID, thickness, color));
-    if (!hPen) return; // Verificar que se creó correctamente
-    
-    GdiCache::GdiObjectManager gdiMgr(hdc);
-    gdiMgr.Select(hPen);
-    
+    // Lapiz cacheado: antes se creaba y destruia uno en cada llamada.
+    HPEN hPen = GdiCache::GetPenCached(color, thickness);
+    if (!hPen) return;
+
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
     MoveToEx(hdc, x1, y1, NULL);
     LineTo(hdc, x2, y2);
-    
-    // hPen se limpia automáticamente al salir del scope
+    SelectObject(hdc, hOldPen);
 }
 
 // Función para dibujar flecha
@@ -1845,33 +2589,82 @@ void DrawArrow(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thic
 
 // Función para dibujar rectángulo (optimizada)
 void DrawRectangle(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color, int thickness, bool filled) {
-    ScopedPen hPen(CreatePen(PS_SOLID, thickness, color));
-    if (!hPen) return; // Verificar que se creó correctamente
-    
-    // Crear pincel solo si es necesario (filled = true)
+    // Lapiz cacheado (ver GdiCache::GetPenCached).
+    HPEN hPen = GdiCache::GetPenCached(color, thickness);
+    if (!hPen) return;
+
+    // El pincel solo se necesita si hay relleno.
     ScopedBrush hBrush;
     if (filled) {
         hBrush.reset(CreateSolidBrush(color), true);
-        if (!hBrush) return; // Verificar que se creó correctamente
+        if (!hBrush) return;
     }
-    
-    GdiCache::GdiObjectManager gdiMgr(hdc);
-    gdiMgr.Select(hPen);
-    gdiMgr.Select(filled ? hBrush : GetStockObject(NULL_BRUSH));
-    
+
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    HGDIOBJ hOldBrush = SelectObject(hdc, filled ? (HGDIOBJ)hBrush.get()
+                                                 : GetStockObject(NULL_BRUSH));
+
     Rectangle(hdc, x1, y1, x2, y2);
-    
-    // hPen y hBrush se limpian automáticamente al salir del scope
+
+    SelectObject(hdc, hOldBrush);
+    SelectObject(hdc, hOldPen);
 }
 
 // Función para reproducir sonido de captura
+// Sonido de confirmacion de captura.
+//
+// Antes: Beep(2400, 800). Beep() es sincronico, por lo que congelaba el hilo
+// (y con el la interfaz) durante 800 ms en cada captura. PlaySound con SND_ASYNC
+// retorna de inmediato.
 void PlayScreenshotSound() {
-    // Reproducir un beep más fuerte y agudo para indicar captura exitosa
-    // Frecuencia más alta (1200Hz) y duración más larga (300ms) para mayor notoriedad
-    Beep(2400, 800); // 1200Hz por 300ms
+    PlaySoundW(L"SystemAsterisk", NULL,
+               SND_ALIAS | SND_ASYNC | SND_NODEFAULT | SND_NOWAIT);
 }
 
 // Función auxiliar para guardar bitmap como archivo BMP
+// Obtiene el CLSID del codificador GDI+ para un tipo MIME ("image/png", "image/bmp").
+bool GetEncoderClsid(const wchar_t* mimeType, CLSID* clsid) {
+    UINT num = 0, size = 0;
+    if (Gdiplus::GetImageEncodersSize(&num, &size) != Gdiplus::Ok || size == 0) {
+        return false;
+    }
+
+    std::vector<BYTE> buffer(size);
+    Gdiplus::ImageCodecInfo* codecs = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+    if (Gdiplus::GetImageEncoders(num, size, codecs) != Gdiplus::Ok) {
+        return false;
+    }
+
+    for (UINT i = 0; i < num; ++i) {
+        if (wcscmp(codecs[i].MimeType, mimeType) == 0) {
+            *clsid = codecs[i].Clsid;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Guarda un HBITMAP como PNG real usando GDI+.
+//
+// Antes las capturas se escribian con SaveBitmapToFile, que emite un BMP, pero el
+// nombre de archivo terminaba en .png: cada "captura.png" era en realidad un BMP mal
+// etiquetado (~6 MB en 1080p, ~25 MB en 4K) que los visores estrictos rechazan.
+// GDI+ recibe la ruta como wchar_t, por lo que tampoco hace falta convertir a
+// std::string (esa conversion truncaba los acentos de la ruta).
+bool SaveBitmapAsPng(HBITMAP hBitmap, const std::wstring& filePath) {
+    if (!hBitmap || !g_gdiplusReady) return false;
+
+    CLSID pngClsid;
+    if (!GetEncoderClsid(L"image/png", &pngClsid)) return false;
+
+    // FromHBITMAP copia los pixeles, asi que el bitmap original sigue siendo del
+    // llamador y puede liberarse despues.
+    Gdiplus::Bitmap bitmap(hBitmap, static_cast<HPALETTE>(nullptr));
+    if (bitmap.GetLastStatus() != Gdiplus::Ok) return false;
+
+    return bitmap.Save(filePath.c_str(), &pngClsid, nullptr) == Gdiplus::Ok;
+}
+
 bool SaveBitmapToFile(HBITMAP hBitmap, const std::wstring& filePath) {
     // Obtener información del bitmap
     BITMAP bm;
@@ -1912,9 +2705,10 @@ bool SaveBitmapToFile(HBITMAP hBitmap, const std::wstring& filePath) {
         return false;
     }
     
-    // Crear archivo (convertir wstring a string para std::ofstream)
-    std::string filePathStr(filePath.begin(), filePath.end());
-    std::ofstream file(filePathStr, std::ios::binary);
+    // std::ofstream acepta wchar_t* en Windows. Antes se hacia
+    // std::string(filePath.begin(), filePath.end()), que trunca cada wchar_t a char
+    // y rompia cualquier ruta con acentos (p. ej. C:\\Users\\Jose\\...).
+    std::ofstream file(filePath.c_str(), std::ios::binary);
     if (!file.is_open()) {
         SelectObject(hMemDC, hOldBitmap);
         DeleteDC(hMemDC);
@@ -1950,125 +2744,1115 @@ bool SaveBitmapToFile(HBITMAP hBitmap, const std::wstring& filePath) {
 }
 
 // Función para guardar captura en el directorio del ejecutable
+// Devuelve la carpeta destino de las capturas, creandola si hace falta.
+//
+// Antes se guardaba junto al .exe. La aplicacion corre elevada y puede estar
+// instalada en Program Files, donde la escritura falla; por eso ahora se usa por
+// defecto la carpeta de imagenes del usuario.
+std::wstring GetScreenshotFolder() {
+    if (!screenshot_folder.empty()) {
+        SHCreateDirectoryExW(NULL, screenshot_folder.c_str(), NULL);
+        return screenshot_folder;
+    }
+
+    PWSTR picturesPath = nullptr;
+    std::wstring folder;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, NULL, &picturesPath))) {
+        folder = std::wstring(picturesPath) + L"\\Screenshots";
+        CoTaskMemFree(picturesPath);
+    } else {
+        // Respaldo: la carpeta del ejecutable.
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        std::wstring exePathStr(exePath);
+        size_t lastSlash = exePathStr.find_last_of(L"\\/");
+        folder = exePathStr.substr(0, lastSlash);
+    }
+
+    SHCreateDirectoryExW(NULL, folder.c_str(), NULL);
+    return folder;
+}
+
+// Guarda la captura en disco.
+//
+// Correcciones respecto a la version anterior:
+//  - Escribe un PNG real. Antes se generaba un BMP con extension .png, es decir
+//    cada "captura.png" era un BMP mal etiquetado (~6 MB en 1080p, ~25 MB en 4K).
+//  - Incluye milisegundos y un contador anticolision: con resolucion de 1 segundo
+//    dos capturas consecutivas se sobreescribian.
+//  - Informa el fallo. Antes las dos ramas del if estaban vacias, asi que un
+//    error de escritura pasaba totalmente inadvertido.
 void SaveScreenshotToDownloads(HBITMAP hBitmap, int x1, int y1, int x2, int y2) {
     (void)x1; (void)y1; (void)x2; (void)y2; // Parámetros no utilizados
-    // Obtener el directorio del ejecutable
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring exePathStr = std::wstring(exePath);
-    size_t lastSlash = exePathStr.find_last_of(L"\\/");
-    std::wstring exeDir = exePathStr.substr(0, lastSlash + 1);
-    
-    // Generar nombre de archivo con formato dd_MM_yyyy-HH-mm-ss.png
+
+    const bool useBmp = (screenshot_format == L"bmp");
+    const wchar_t* ext = useBmp ? L"bmp" : L"png";
+    const std::wstring folder = GetScreenshotFolder();
+
     SYSTEMTIME st;
     GetLocalTime(&st);
-    
-    // Formatear fecha y hora con ceros a la izquierda
+
+    std::wstring fullPath;
     wchar_t filename[256];
-    swprintf_s(filename, L"%02d_%02d_%04d-%02d-%02d-%02d.png", 
-               st.wDay, st.wMonth, st.wYear, 
-               st.wHour, st.wMinute, st.wSecond);
-    
-    std::wstring fullPath = exeDir + std::wstring(filename);
-    
-    // Usar directamente el bitmap capturado (ya contiene la región correcta)
-    if (SaveBitmapToFile(hBitmap, fullPath)) {
-        // Éxito: archivo guardado correctamente
-    } else {
-        // Error: no se pudo guardar el archivo
+
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        if (attempt == 0) {
+            swprintf_s(filename, L"%02d_%02d_%04d-%02d-%02d-%02d_%03d.%s",
+                       st.wDay, st.wMonth, st.wYear,
+                       st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, ext);
+        } else {
+            swprintf_s(filename, L"%02d_%02d_%04d-%02d-%02d-%02d_%03d_%d.%s",
+                       st.wDay, st.wMonth, st.wYear,
+                       st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                       attempt, ext);
+        }
+        fullPath = folder + L"\\" + filename;
+        if (GetFileAttributesW(fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+    }
+
+    const bool saved = useBmp ? SaveBitmapToFile(hBitmap, fullPath)
+                              : SaveBitmapAsPng(hBitmap, fullPath);
+
+    if (!saved) {
+        OutputDebugStringW((L"Screen Highlighter: fallo al guardar " + fullPath +
+                            L"\n").c_str());
+        MessageBoxW(NULL,
+            (L"Could not save the screenshot to:\n\n" + fullPath +
+             L"\n\nCheck the folder permissions.").c_str(),
+            L"Screen Highlighter", MB_OK | MB_ICONWARNING);
     }
 }
 
 // Función para capturar región de pantalla
+// Captura una region de la pantalla, la copia al portapapeles y la guarda.
+//
+// Correcciones respecto a la version anterior:
+//  - A2: se hacia SetClipboardData(CF_BITMAP, hBitmap) y despues
+//    DeleteObject(hBitmap). SetClipboardData transfiere la propiedad del handle al
+//    portapapeles, asi que el DeleteObject destruia el bitmap que el portapapeles
+//    acababa de recibir: al pegar no aparecia nada o aparecia basura. Ademas el
+//    bitmap seguia seleccionado en el DC de memoria, lo que tampoco es valido.
+//    Ahora se deselecciona primero y se entrega una copia independiente.
+//  - A9: el overlay (topmost y layered) seguia visible durante el BitBlt, por lo
+//    que el tinte oscuro quedaba grabado en la captura. Ahora se oculta el overlay,
+//    se captura el escritorio limpio y se vuelve a mostrar.
+//  - A8: se corrigio la fuga del DC de memoria en el retorno temprano.
 void CaptureScreenRegion(int x1, int y1, int x2, int y2) {
     // Asegurar coordenadas correctas
     int left = std::min(x1, x2);
     int top = std::min(y1, y2);
     int right = std::max(x1, x2);
     int bottom = std::max(y1, y2);
-    
+
     // Verificar tamaño mínimo
     if ((right - left) < 5 || (bottom - top) < 5) {
         return; // Región muy pequeña
     }
-    
-    // Capturar la pantalla (excluyendo el borde de selección)
-    HDC hScreenDC = GetDC(NULL);
-    HDC hMemDC = CreateCompatibleDC(hScreenDC);
-    
+
     // Reducir ligeramente la región para excluir el borde de selección
-    int borderOffset = 2; // 2 píxeles de margen para excluir el borde
+    const int borderOffset = 2;
     int captureLeft = left + borderOffset;
     int captureTop = top + borderOffset;
     int captureRight = right - borderOffset;
     int captureBottom = bottom - borderOffset;
-    
-    // Asegurar que la región de captura sea válida
+
     if (captureRight <= captureLeft || captureBottom <= captureTop) {
-        ReleaseDC(NULL, hScreenDC);
         return;
     }
-    
-    int width = captureRight - captureLeft;
-    int height = captureBottom - captureTop;
-    
+
+    const int width = captureRight - captureLeft;
+    const int height = captureBottom - captureTop;
+
+    // Ocultar el overlay para que su tinte no quede grabado en la captura.
+    HWND overlay = hCurrentOverlay.load();
+    bool overlayWasVisible = false;
+    if (overlay && IsWindowVisible(overlay)) {
+        overlayWasVisible = true;
+        ShowWindow(overlay, SW_HIDE);
+        // Dar tiempo a que DWM recomponga el escritorio sin el overlay.
+        UpdateWindow(GetDesktopWindow());
+        Sleep(30);
+    }
+
+    HDC hScreenDC = GetDC(NULL);
+    if (!hScreenDC) {
+        if (overlayWasVisible) ShowWindow(overlay, SW_SHOW);
+        return;
+    }
+
+    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+    if (!hMemDC) {
+        ReleaseDC(NULL, hScreenDC);
+        if (overlayWasVisible) ShowWindow(overlay, SW_SHOW);
+        return;
+    }
+
     HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+    if (!hBitmap) {
+        DeleteDC(hMemDC);
+        ReleaseDC(NULL, hScreenDC);
+        if (overlayWasVisible) ShowWindow(overlay, SW_SHOW);
+        return;
+    }
+
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
-    
-    // Copiar la región de la pantalla (sin el borde de selección)
-    BitBlt(hMemDC, 0, 0, width, height, hScreenDC, captureLeft, captureTop, SRCCOPY);
-    
-    // Copiar al clipboard
+
+    // Copiar el escritorio limpio (sin overlay).
+    // Las coordenadas vienen en espacio de cliente del overlay; el DC de pantalla
+    // usa coordenadas de pantalla, que difieren por el origen virtual.
+    BitBlt(hMemDC, 0, 0, width, height, hScreenDC,
+           ClientToScreenX(captureLeft), ClientToScreenY(captureTop), SRCCOPY);
+
+    // Volver a dibujar las anotaciones sobre la captura, trasladadas al origen de
+    // la region. Asi la captura conserva los dibujos pero no el tinte del overlay.
+    {
+        std::lock_guard<std::mutex> lock(g_annotationMutex);
+        SetViewportOrgEx(hMemDC, -captureLeft, -captureTop, NULL);
+        for (const auto& element : drawing_elements) {
+            switch (element.tool_type) {
+                case DrawingTool::Line:
+                    DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2,
+                             element.color, element.thickness);
+                    break;
+                case DrawingTool::Arrow:
+                    DrawArrow(hMemDC, element.x1, element.y1, element.x2, element.y2,
+                              element.color, element.thickness);
+                    break;
+                case DrawingTool::Rectangle:
+                    DrawRectangle(hMemDC, element.x1, element.y1, element.x2, element.y2,
+                                  element.color, element.thickness, element.filled);
+                    break;
+                case DrawingTool::Highlighter:
+                    DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2,
+                                    element.color);
+                    break;
+                case DrawingTool::Ellipse:
+                    DrawEllipseShape(hMemDC, element.x1, element.y1, element.x2, element.y2,
+                                     element.color, element.thickness, element.filled);
+                    break;
+                case DrawingTool::Pen:
+                    DrawPenStroke(hMemDC, element.points, element.color, element.thickness);
+                    break;
+                case DrawingTool::Redact:
+                    // Se pixela desde la captura limpia recien tomada, no desde la
+                    // copia de apertura, para reflejar el contenido actual.
+                    DrawRedaction(hMemDC, hMemDC, element.x1, element.y1,
+                                  element.x2, element.y2, element.thickness * 4);
+                    break;
+                case DrawingTool::Step:
+                    DrawStepMarker(hMemDC, element.x1, element.y1, element.step_number,
+                                   element.color, element.thickness);
+                    break;
+                default:
+                    break;
+            }
+        }
+        SetViewportOrgEx(hMemDC, 0, 0, NULL);
+    }
+
+    // Restaurar el overlay antes de las operaciones lentas (guardado en disco).
+    if (overlayWasVisible) ShowWindow(overlay, SW_SHOW);
+
+    // IMPORTANTE: deseleccionar el bitmap del DC antes de usarlo o publicarlo.
+    SelectObject(hMemDC, hOldBitmap);
+
+    // Guardar en disco (usa el bitmap, no lo consume).
+    SaveScreenshotToDownloads(hBitmap, left, top, right, bottom);
+
+    // Copiar al portapapeles una COPIA independiente: el portapapeles se vuelve
+    // dueño de lo que recibe, y este lado sigue siendo dueño de hBitmap.
     if (OpenClipboard(NULL)) {
         EmptyClipboard();
-        SetClipboardData(CF_BITMAP, hBitmap);
+        HBITMAP hClipboardCopy = (HBITMAP)CopyImage(hBitmap, IMAGE_BITMAP, 0, 0, 0);
+        if (hClipboardCopy) {
+            if (!SetClipboardData(CF_BITMAP, hClipboardCopy)) {
+                DeleteObject(hClipboardCopy); // el portapapeles no lo acepto
+            }
+        }
         CloseClipboard();
     }
-    
-    // Guardar en el directorio del ejecutable
-    SaveScreenshotToDownloads(hBitmap, left, top, right, bottom);
-    
-    // Reproducir sonido de confirmación
+
+    // Reproducir sonido de confirmación (asincrono)
     PlayScreenshotSound();
-    
-    // Limpiar recursos
-    SelectObject(hMemDC, hOldBitmap);
+
+    // Limpiar recursos propios
     DeleteObject(hBitmap);
     DeleteDC(hMemDC);
     ReleaseDC(NULL, hScreenDC);
 }
 
-// Función para dibujar resaltador (capa amarilla casi opaca)
-void DrawHighlighter(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color) {
-    (void)color; // Parámetro no utilizado
-    // Color amarillo casi opaco (solo 10% transparente)
-    // Usar un amarillo muy opaco para máxima visibilidad
-    COLORREF yellowColor = RGB(255, 255, 25); // Amarillo casi opaco
-    
-    // Crear pincel amarillo casi opaco
-    ScopedBrush hBrush(CreateSolidBrush(yellowColor), true);
-    if (!hBrush) return; // Verificar que se creó correctamente
-    
-    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrush);
-    
-    // Configurar modo de mezcla para crear transparencia real
-    // R2_MASKPEN crea una capa transparente real sin invertir colores
-    int oldROP = SetROP2(hdc, R2_MASKPEN);
-    
-    // Dibujar rectángulo que crea una capa casi opaca
-    Rectangle(hdc, x1, y1, x2, y2);
-    
-    // Restaurar modo de mezcla original
-    SetROP2(hdc, oldROP);
-    
+// Dibuja una elipse. Espeja a DrawRectangle.
+void DrawEllipseShape(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color,
+                      int thickness, bool filled) {
+    HPEN hPen = GdiCache::GetPenCached(color, thickness);
+    if (!hPen) return;
+
+    ScopedBrush hBrush;
+    if (filled) {
+        hBrush.reset(CreateSolidBrush(color), true);
+        if (!hBrush) return;
+    }
+
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    HGDIOBJ hOldBrush = SelectObject(hdc, filled ? (HGDIOBJ)hBrush.get()
+                                                 : GetStockObject(NULL_BRUSH));
+    Ellipse(hdc, x1, y1, x2, y2);
     SelectObject(hdc, hOldBrush);
-    // hBrush se limpia automáticamente al salir del scope
+    SelectObject(hdc, hOldPen);
+}
+
+// Dibuja un trazo libre.
+void DrawPenStroke(HDC hdc, const std::vector<POINT>& points, COLORREF color,
+                   int thickness) {
+    if (points.size() < 2) {
+        // Un solo punto: dibujar un punto grueso para que se vea algo.
+        if (points.size() == 1) {
+            HPEN hPen = GdiCache::GetPenCached(color, thickness);
+            if (!hPen) return;
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+            MoveToEx(hdc, points[0].x, points[0].y, NULL);
+            LineTo(hdc, points[0].x + 1, points[0].y);
+            SelectObject(hdc, hOldPen);
+        }
+        return;
+    }
+
+    HPEN hPen = GdiCache::GetPenCached(color, thickness);
+    if (!hPen) return;
+
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    // Polyline dibuja todo el trazo en una sola llamada a GDI.
+    Polyline(hdc, points.data(), static_cast<int>(points.size()));
+    SelectObject(hdc, hOldPen);
+}
+
+// Dibuja un marcador de paso: circulo relleno con un numero centrado.
+void DrawStepMarker(HDC hdc, int x, int y, int number, COLORREF color, int thickness) {
+    const int radius = std::clamp(10 + thickness * 2, 12, 40);
+
+    ScopedBrush hBrush(CreateSolidBrush(color), true);
+    if (!hBrush) return;
+
+    HPEN hPen = GdiCache::GetPenCached(RGB(255, 255, 255), 2);
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    HGDIOBJ hOldBrush = SelectObject(hdc, (HGDIOBJ)hBrush.get());
+
+    Ellipse(hdc, x - radius, y - radius, x + radius, y + radius);
+
+    SelectObject(hdc, hOldBrush);
+    SelectObject(hdc, hOldPen);
+
+    wchar_t label[16];
+    swprintf_s(label, L"%d", number);
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, GdiCache::hCachedFontIndicator);
+    const int oldMode = SetBkMode(hdc, TRANSPARENT);
+    const COLORREF oldColor = SetTextColor(hdc, RGB(255, 255, 255));
+
+    RECT r = {x - radius, y - radius, x + radius, y + radius};
+    DrawTextW(hdc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    SetTextColor(hdc, oldColor);
+    SetBkMode(hdc, oldMode);
+    SelectObject(hdc, hOldFont);
+}
+
+// Pixela una region para ocultar informacion sensible.
+//
+// Reduce el area a 1/blockSize con StretchBlt y la vuelve a ampliar, lo que
+// produce bloques grandes. Es la forma mas barata de censurar con GDI puro y no
+// se puede revertir, a diferencia de un desenfoque suave.
+//
+// hdcSrc debe contener pixeles reales del escritorio (la copia limpia), porque en
+// el back buffer del overlay esa zona es color clave, no contenido.
+void DrawRedaction(HDC hdcDest, HDC hdcSrc, int x1, int y1, int x2, int y2,
+                   int blockSize) {
+    const int left = std::min(x1, x2);
+    const int top = std::min(y1, y2);
+    const int width = std::abs(x2 - x1);
+    const int height = std::abs(y2 - y1);
+    if (width <= 0 || height <= 0) return;
+
+    if (!hdcSrc) {
+        // Sin fuente disponible: rellenar en negro. Censurar de mas es preferible
+        // a dejar el contenido visible.
+        RECT r = {left, top, left + width, top + height};
+        FillRect(hdcDest, &r, GdiCache::hBlackBrush);
+        return;
+    }
+
+    blockSize = std::clamp(blockSize, 2, 64);
+    const int smallW = std::max(1, width / blockSize);
+    const int smallH = std::max(1, height / blockSize);
+
+    HDC hTmpDC = CreateCompatibleDC(hdcSrc);
+    if (!hTmpDC) return;
+
+    HBITMAP hTmpBmp = CreateCompatibleBitmap(hdcSrc, smallW, smallH);
+    if (!hTmpBmp) {
+        DeleteDC(hTmpDC);
+        return;
+    }
+
+    HBITMAP hOldTmp = (HBITMAP)SelectObject(hTmpDC, hTmpBmp);
+
+    // Reducir (promediando) y luego ampliar sin suavizado.
+    SetStretchBltMode(hTmpDC, HALFTONE);
+    SetBrushOrgEx(hTmpDC, 0, 0, NULL);
+    StretchBlt(hTmpDC, 0, 0, smallW, smallH,
+               hdcSrc, left, top, width, height, SRCCOPY);
+
+    SetStretchBltMode(hdcDest, COLORONCOLOR);
+    StretchBlt(hdcDest, left, top, width, height,
+               hTmpDC, 0, 0, smallW, smallH, SRCCOPY);
+
+    SelectObject(hTmpDC, hOldTmp);
+    DeleteObject(hTmpBmp);
+    DeleteDC(hTmpDC);
+}
+
+// Función para dibujar resaltador (capa amarilla casi opaca)
+// Dibuja una capa translucida (resaltador).
+//
+// Antes se usaba SetROP2(hdc, R2_MASKPEN), que hace un AND bit a bit entre el
+// color y el destino. Fuera del modo zoom el destino es el overlay negro, y
+// amarillo AND negro = negro: el resaltado era literalmente invisible. Dentro del
+// zoom el destino es la captura de pantalla (pixeles claros), por lo que ahi si se
+// veia. Eso explica el bug conocido "el resaltador no funciona fuera del zoom".
+//
+// Ahora se usa AlphaBlend, que mezcla de verdad contra cualquier fondo, y se
+// respeta el color elegido por el usuario (antes se descartaba con (void)color y
+// el resaltador era siempre amarillo).
+void DrawHighlighter(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color) {
+    const int left = std::min(x1, x2);
+    const int top = std::min(y1, y2);
+    const int width = std::abs(x2 - x1);
+    const int height = std::abs(y2 - y1);
+    if (width <= 0 || height <= 0) return;
+
+    const BYTE alpha = static_cast<BYTE>(
+        std::clamp(highlighter_alpha.load(), 1, 255));
+
+    if (GdiCache::hBlendDC && GdiCache::pBlendPixel) {
+        // AlphaBlend con AlphaFormat = 0 ignora el canal alfa del origen y usa
+        // SourceConstantAlpha, asi que basta un origen de 1x1 estirado.
+        // El DIB es BGRA en memoria.
+        *GdiCache::pBlendPixel = (static_cast<DWORD>(GetRValue(color)) << 16) |
+                                 (static_cast<DWORD>(GetGValue(color)) << 8) |
+                                  static_cast<DWORD>(GetBValue(color)) |
+                                 (0xFFu << 24);
+
+        BLENDFUNCTION blend;
+        blend.BlendOp = AC_SRC_OVER;
+        blend.BlendFlags = 0;
+        blend.SourceConstantAlpha = alpha;
+        blend.AlphaFormat = 0;
+
+        if (AlphaBlend(hdc, left, top, width, height,
+                       GdiCache::hBlendDC, 0, 0, 1, 1, blend)) {
+            return;
+        }
+    }
+
+    // Respaldo si AlphaBlend no esta disponible: relleno opaco. Sigue siendo
+    // visible sobre cualquier fondo, que es lo que fallaba antes.
+    ScopedBrush hBrush(CreateSolidBrush(color), true);
+    if (!hBrush) return;
+    RECT r = {left, top, left + width, top + height};
+    FillRect(hdc, &r, hBrush);
+}
+
+// ============================================================================
+// RENDERIZADO DE TEXTO DE ANOTACION (unificado)
+// ============================================================================
+// Antes existian dos copias casi identicas de este codigo dentro de DrawOverlay,
+// una para el modo zoom y otra para el modo normal, y habian divergido: solo la
+// copia del zoom dibujaba los marcadores [IMAGE_n]/[GIF_n], y la copia normal
+// exigia text_input_mode para mostrar algo. De ahi venian los dos bugs conocidos
+// ("pegar imagen no funciona fuera del zoom" y el texto que desaparecia).
+
+namespace TextRender {
+
+constexpr int kLineHeight = 20;     // altura de una linea de texto
+constexpr int kPadding = 10;        // margen horizontal dentro del cuadro
+constexpr int kMinBoxWidth = 100;
+constexpr int kMaxBoxWidth = 1200;
+
+// Una linea ya medida y posicionada.
+struct LineBox {
+    std::wstring content;
+    size_t startPos = 0;    // offset en zoom_text donde empieza la linea
+    size_t endPos = 0;      // offset donde termina (antes del salto de linea)
+    int y = 0;              // posicion Y relativa al inicio del cuadro
+    int height = kLineHeight;
+    int imageIndex = -1;    // >= 0 si la linea representa una imagen
+    int gifIndex = -1;      // >= 0 si la linea representa un GIF
+};
+
+// Extrae el indice de un marcador tipo "[IMAGE_3]" o "[GIF_2]".
+// Devuelve -1 si la linea no contiene ese marcador o no se puede interpretar.
+int ParseMarker(const std::wstring& line, const wchar_t* prefix, size_t prefixLen) {
+    const size_t start = line.find(prefix);
+    if (start == std::wstring::npos) return -1;
+    const size_t end = line.find(L']', start);
+    if (end == std::wstring::npos) return -1;
+
+    const std::wstring digits = line.substr(start + prefixLen, end - start - prefixLen);
+    if (digits.empty()) return -1;
+    for (wchar_t c : digits) {
+        if (c < L'0' || c > L'9') return -1;   // evita depender de excepciones
+    }
+    try {
+        return std::stoi(digits);
+    } catch (...) {
+        return -1;
+    }
+}
+
+// Construye el layout completo del texto: una pasada, reutilizada despues para
+// dibujar, para el resaltado de seleccion y para ubicar el cursor. Antes el texto
+// se recorria tres veces por frame (ancho, dibujo y cursor).
+//
+// Requiere que el llamador ya tenga tomado g_annotationMutex.
+std::vector<LineBox> BuildLayout(HDC hdc, const std::wstring& text, int* outBoxWidth) {
+    std::vector<LineBox> boxes;
+    int boxWidth = kMinBoxWidth;
+
+    const std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(text);
+    boxes.reserve(lines.size());
+
+    int y = 0;
+    for (const auto& line : lines) {
+        LineBox box;
+        box.content = line.content;
+        box.startPos = line.startPos;
+        box.endPos = line.endPos;
+        box.y = y;
+        box.imageIndex = ParseMarker(line.content, L"[IMAGE_", 7);
+        box.gifIndex = (box.imageIndex >= 0)
+                           ? -1
+                           : ParseMarker(line.content, L"[GIF_", 5);
+
+        if (box.imageIndex >= 0 &&
+            box.imageIndex < static_cast<int>(clipboard_images.size()) &&
+            clipboard_images[box.imageIndex]) {
+            const SIZE sz = GdiCache::GetBitmapSize(clipboard_images[box.imageIndex].get());
+            if (sz.cx > 0 && sz.cy > 0) {
+                box.height = static_cast<int>(sz.cy) + 5;
+                boxWidth = std::max(boxWidth, static_cast<int>(sz.cx) + 2 * kPadding);
+            } else {
+                box.imageIndex = -1;   // bitmap invalido: tratar como texto
+            }
+        } else if (box.gifIndex >= 0 &&
+                   box.gifIndex < static_cast<int>(gif_elements.size()) &&
+                   !gif_elements[box.gifIndex].frames.empty()) {
+            const GifElement& gif = gif_elements[box.gifIndex];
+            box.height = gif.height + 5;
+            boxWidth = std::max(boxWidth, gif.width + 2 * kPadding);
+        } else {
+            box.imageIndex = -1;
+            box.gifIndex = -1;
+            if (!box.content.empty()) {
+                const SIZE sz = GdiCache::GetTextSizeCached(hdc, box.content);
+                boxWidth = std::max(boxWidth, static_cast<int>(sz.cx) + 4 * kPadding);
+            }
+        }
+
+        y += box.height;
+        boxes.push_back(std::move(box));
+    }
+
+    if (outBoxWidth) *outBoxWidth = std::clamp(boxWidth, kMinBoxWidth, kMaxBoxWidth);
+    return boxes;
+}
+
+// Dibuja una imagen o un frame de GIF ya seleccionado en un DC temporal.
+void BlitBitmap(HDC hdc, HBITMAP hBitmap, int x, int y, int w, int h) {
+    if (!hBitmap || w <= 0 || h <= 0) return;
+    HDC hTmp = CreateCompatibleDC(hdc);
+    if (!hTmp) return;
+    HBITMAP hOld = (HBITMAP)SelectObject(hTmp, hBitmap);
+    BitBlt(hdc, x, y, w, h, hTmp, 0, 0, SRCCOPY);
+    SelectObject(hTmp, hOld);
+    DeleteDC(hTmp);
+}
+
+// Dibuja el texto de anotacion, sus imagenes/GIFs incrustados, el resaltado de
+// seleccion y el cursor.
+//
+//   anchorX/anchorY : esquina superior izquierda del cuadro de texto.
+//   anchorWidth     : si es > 0, el cuadro se centra dentro de
+//                     [anchorX, anchorX + anchorWidth] (modo zoom). Si es 0, el
+//                     cuadro se alinea a la izquierda en anchorX (modo normal).
+//
+// Requiere que el llamador ya tenga tomado g_annotationMutex.
+void RenderAnnotationText(HDC hdc, HFONT font, int anchorX, int anchorY, int anchorWidth) {
+    if (zoom_text.empty()) return;
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, font);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    SetBkMode(hdc, TRANSPARENT);
+
+    int boxWidth = kMinBoxWidth;
+    const std::vector<LineBox> boxes = BuildLayout(hdc, zoom_text, &boxWidth);
+
+    const int boxX = (anchorWidth > 0) ? anchorX + (anchorWidth - boxWidth) / 2
+                                       : anchorX;
+    const int boxY = anchorY;
+    const int textX = boxX + kPadding;
+
+    // Rango de seleccion normalizado.
+    bool hasSelection = false;
+    int selStart = 0, selEnd = 0;
+    if (text_selection_active.load()) {
+        selStart = std::min(text_selection_start.load(), text_selection_end.load());
+        selEnd = std::max(text_selection_start.load(), text_selection_end.load());
+        hasSelection = (selStart >= 0 && selEnd > selStart);
+    }
+
+    for (const auto& box : boxes) {
+        const int lineY = boxY + box.y;
+
+        if (box.imageIndex >= 0) {
+            const HBITMAP hImage = clipboard_images[box.imageIndex].get();
+            const SIZE sz = GdiCache::GetBitmapSize(hImage);
+            BlitBitmap(hdc, hImage, boxX + (boxWidth - static_cast<int>(sz.cx)) / 2,
+                       lineY, static_cast<int>(sz.cx), static_cast<int>(sz.cy));
+            continue;
+        }
+
+        if (box.gifIndex >= 0) {
+            const GifElement& gif = gif_elements[box.gifIndex];
+            const int frame = std::clamp(gif.current_frame, 0,
+                                         static_cast<int>(gif.frames.size()) - 1);
+            BlitBitmap(hdc, gif.frames[frame].get(),
+                       boxX + (boxWidth - gif.width) / 2, lineY,
+                       gif.width, gif.height);
+            continue;
+        }
+
+        if (box.content.empty()) continue;
+
+        RECT lineRect = {textX, lineY, boxX + boxWidth - kPadding, lineY + box.height};
+        DrawTextW(hdc, box.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP | DT_NOPREFIX);
+
+        // Resaltado de la parte seleccionada de esta linea.
+        if (hasSelection) {
+            const int lineStart = static_cast<int>(box.startPos);
+            const int lineEnd = static_cast<int>(box.endPos);
+            if (selStart < lineEnd && selEnd > lineStart) {
+                const int from = std::clamp(selStart - lineStart, 0,
+                                            static_cast<int>(box.content.length()));
+                const int to = std::clamp(selEnd - lineStart, 0,
+                                          static_cast<int>(box.content.length()));
+                if (from < to) {
+                    const SIZE before = GdiCache::GetTextSizeCached(
+                        hdc, box.content.substr(0, from));
+                    const std::wstring selected = box.content.substr(from, to - from);
+                    const SIZE selSize = GdiCache::GetTextSizeCached(hdc, selected);
+
+                    RECT selRect = {textX + static_cast<int>(before.cx), lineY,
+                                    textX + static_cast<int>(before.cx) +
+                                        static_cast<int>(selSize.cx),
+                                    lineY + box.height};
+                    FillRect(hdc, &selRect, GdiCache::hSelectionBrush);
+                    DrawTextW(hdc, selected.c_str(), -1, &selRect,
+                              DT_LEFT | DT_TOP | DT_NOPREFIX);
+                }
+            }
+        }
+    }
+
+    // Cursor. Se ubica con el MISMO layout que se acaba de dibujar, por lo que ya
+    // no se desincroniza en las lineas que contienen imagenes (antes el recorrido
+    // del cursor asumia 50 px fijos de alto para las imagenes).
+    if (text_input_mode.load() && text_cursor_visible.load()) {
+        const int caret = std::clamp(text_cursor_pos.load(), 0,
+                                     static_cast<int>(zoom_text.length()));
+        int cursorX = textX;
+        int cursorY = boxY;
+
+        for (const auto& box : boxes) {
+            const int lineStart = static_cast<int>(box.startPos);
+            const int lineEnd = static_cast<int>(box.endPos);
+            if (caret >= lineStart && caret <= lineEnd) {
+                if (box.imageIndex >= 0 || box.gifIndex >= 0) {
+                    // Despues de una imagen el cursor va al inicio de la siguiente linea.
+                    cursorX = textX;
+                    cursorY = boxY + box.y + box.height;
+                } else {
+                    const SIZE upTo = GdiCache::GetTextSizeCached(
+                        hdc, box.content.substr(0, caret - lineStart));
+                    cursorX = textX + static_cast<int>(upTo.cx);
+                    cursorY = boxY + box.y;
+                }
+                break;
+            }
+            // El cursor esta mas abajo: seguir acumulando.
+            cursorY = boxY + box.y + box.height;
+        }
+
+        HPEN hOldPen = (HPEN)SelectObject(hdc, GdiCache::hCursorPen);
+        MoveToEx(hdc, cursorX, cursorY, NULL);
+        LineTo(hdc, cursorX, cursorY + kLineHeight);
+        SelectObject(hdc, hOldPen);
+    }
+
+    SelectObject(hdc, hOldFont);
+}
+
+} // namespace TextRender
+
+// ----------------------------------------------------------------------------
+// Copia del escritorio limpio
+// ----------------------------------------------------------------------------
+// Se toma justo antes de mostrar el overlay, por lo que contiene el escritorio
+// SIN el tinte del overlay. Es la fuente que necesita la herramienta de pixelado:
+// el back buffer no sirve porque ahi las regiones son color clave, no pixeles
+// reales del escritorio.
+static HDC g_cleanDesktopDC = nullptr;
+static HBITMAP g_cleanDesktopBitmap = nullptr;
+static HBITMAP g_cleanDesktopOldBitmap = nullptr;
+static int g_cleanDesktopWidth = 0;
+static int g_cleanDesktopHeight = 0;
+
+void ReleaseCleanDesktop() {
+    if (g_cleanDesktopDC) {
+        if (g_cleanDesktopOldBitmap) {
+            SelectObject(g_cleanDesktopDC, g_cleanDesktopOldBitmap);
+        }
+        DeleteDC(g_cleanDesktopDC);
+        g_cleanDesktopDC = nullptr;
+    }
+    if (g_cleanDesktopBitmap) {
+        DeleteObject(g_cleanDesktopBitmap);
+        g_cleanDesktopBitmap = nullptr;
+    }
+    g_cleanDesktopOldBitmap = nullptr;
+    g_cleanDesktopWidth = 0;
+    g_cleanDesktopHeight = 0;
+}
+
+// Captura el escritorio virtual completo. Las coordenadas del bitmap resultante
+// coinciden con las de cliente del overlay.
+bool CaptureCleanDesktop(int width, int height) {
+    ReleaseCleanDesktop();
+    if (width <= 0 || height <= 0) return false;
+
+    HDC hScreenDC = GetDC(NULL);
+    if (!hScreenDC) return false;
+
+    HDC dc = CreateCompatibleDC(hScreenDC);
+    if (!dc) {
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+
+    HBITMAP bmp = CreateCompatibleBitmap(hScreenDC, width, height);
+    if (!bmp) {
+        DeleteDC(dc);
+        ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+
+    g_cleanDesktopOldBitmap = (HBITMAP)SelectObject(dc, bmp);
+    BitBlt(dc, 0, 0, width, height, hScreenDC,
+           VirtualScreenLeft(), VirtualScreenTop(), SRCCOPY);
+
+    ReleaseDC(NULL, hScreenDC);
+
+    g_cleanDesktopDC = dc;
+    g_cleanDesktopBitmap = bmp;
+    g_cleanDesktopWidth = width;
+    g_cleanDesktopHeight = height;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Back buffer del overlay (doble buffering)
+// ----------------------------------------------------------------------------
+// Antes DrawOverlay creaba y destruia el DC y el bitmap de pantalla completa en
+// CADA frame (~8 MB en 1080p, ~33 MB en 4K). Ahora se conservan y solo se
+// reconstruyen cuando cambia el tamaño.
+static HDC g_overlayBackDC = nullptr;
+static HBITMAP g_overlayBackBitmap = nullptr;
+static HBITMAP g_overlayBackOldBitmap = nullptr;
+static int g_overlayBackWidth = 0;
+static int g_overlayBackHeight = 0;
+
+void ReleaseOverlayBackBuffer() {
+    if (g_overlayBackDC) {
+        if (g_overlayBackOldBitmap) {
+            SelectObject(g_overlayBackDC, g_overlayBackOldBitmap);
+        }
+        DeleteDC(g_overlayBackDC);
+        g_overlayBackDC = nullptr;
+    }
+    if (g_overlayBackBitmap) {
+        DeleteObject(g_overlayBackBitmap);
+        g_overlayBackBitmap = nullptr;
+    }
+    g_overlayBackOldBitmap = nullptr;
+    g_overlayBackWidth = 0;
+    g_overlayBackHeight = 0;
+}
+
+// Un back buffer recien creado tiene contenido indefinido, asi que el primer
+// frame que lo use debe pintarse entero aunque solo se haya invalidado una zona:
+// si no, el resto de la pantalla queda con basura.
+static bool g_overlayBackBufferIsFresh = false;
+
+// Devuelve el DC del back buffer, creandolo solo si no existe o si cambio el
+// tamaño. El bitmap queda seleccionado permanentemente en el DC.
+HDC AcquireOverlayBackBuffer(HDC hdc, int width, int height) {
+    if (width <= 0 || height <= 0) return nullptr;
+
+    if (g_overlayBackDC && g_overlayBackWidth == width && g_overlayBackHeight == height) {
+        return g_overlayBackDC;
+    }
+
+    ReleaseOverlayBackBuffer();
+    g_overlayBackBufferIsFresh = true;
+
+    HDC dc = CreateCompatibleDC(hdc);
+    if (!dc) return nullptr;
+
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, width, height);
+    if (!bmp) {
+        DeleteDC(dc);
+        return nullptr;
+    }
+
+    g_overlayBackDC = dc;
+    g_overlayBackBitmap = bmp;
+    g_overlayBackOldBitmap = (HBITMAP)SelectObject(dc, bmp);
+    g_overlayBackWidth = width;
+    g_overlayBackHeight = height;
+    return dc;
+}
+
+// ----------------------------------------------------------------------------
+// Selector de color y grosor sobre el overlay
+// ----------------------------------------------------------------------------
+// La geometria se define una sola vez y la usan tanto el dibujado como la
+// deteccion de clics, para que no puedan desincronizarse.
+namespace Toolbar {
+
+constexpr int kX = 20;
+constexpr int kY = 55;          // justo debajo del indicador de herramienta
+constexpr int kSwatchSize = 26;
+constexpr int kGap = 4;
+
+// OJO: el overlay usa LWA_COLORKEY con magenta RGB(255,0,255) y cian
+// RGB(0,255,255) como colores transparentes, asi que la paleta NO puede incluir
+// exactamente esos dos valores: la muestra se volveria invisible y lo dibujado
+// con ese color desapareceria.
+constexpr COLORREF kColors[] = {
+    RGB(255, 0, 0),      // rojo
+    RGB(255, 128, 0),    // naranja
+    RGB(255, 255, 0),    // amarillo
+    RGB(0, 200, 0),      // verde
+    RGB(0, 160, 255),    // azul
+    RGB(160, 0, 255),    // violeta
+    RGB(255, 255, 255),  // blanco
+    RGB(0, 0, 0)         // negro
+};
+constexpr int kColorCount = static_cast<int>(sizeof(kColors) / sizeof(kColors[0]));
+
+constexpr int kThicknessValues[] = {2, 4, 8, 14};
+constexpr int kThicknessCount =
+    static_cast<int>(sizeof(kThicknessValues) / sizeof(kThicknessValues[0]));
+
+constexpr int kThicknessRowY = kY + kSwatchSize + kGap;
+
+RECT ColorRect(int index) {
+    const int left = kX + index * (kSwatchSize + kGap);
+    return RECT{left, kY, left + kSwatchSize, kY + kSwatchSize};
+}
+
+RECT ThicknessRect(int index) {
+    const int left = kX + index * (kSwatchSize + kGap);
+    return RECT{left, kThicknessRowY, left + kSwatchSize,
+                kThicknessRowY + kSwatchSize};
+}
+
+void Draw(HDC hdc) {
+    const COLORREF activeColor = static_cast<COLORREF>(drawing_color.load());
+    const int activeThickness = drawing_thickness.load();
+
+    // Fila de colores.
+    for (int i = 0; i < kColorCount; ++i) {
+        RECT r = ColorRect(i);
+
+        ScopedBrush brush(CreateSolidBrush(kColors[i]), true);
+        if (brush) FillRect(hdc, &r, brush);
+
+        // La muestra activa lleva un borde blanco mas grueso.
+        const bool active = (kColors[i] == activeColor);
+        HPEN pen = GdiCache::GetPenCached(active ? RGB(255, 255, 255)
+                                                 : RGB(90, 90, 90),
+                                         active ? 3 : 1);
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+    }
+
+    // Fila de grosores: cada boton muestra una linea de su propio grosor.
+    for (int i = 0; i < kThicknessCount; ++i) {
+        RECT r = ThicknessRect(i);
+        FillRect(hdc, &r, GdiCache::hBlackBrush);
+
+        const bool active = (kThicknessValues[i] == activeThickness);
+        HPEN borderPen = GdiCache::GetPenCached(active ? RGB(255, 255, 255)
+                                                       : RGB(90, 90, 90),
+                                               active ? 3 : 1);
+        HPEN oldPen = (HPEN)SelectObject(hdc, borderPen);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+
+        HPEN samplePen = GdiCache::GetPenCached(activeColor, kThicknessValues[i]);
+        oldPen = (HPEN)SelectObject(hdc, samplePen);
+        const int midY = (r.top + r.bottom) / 2;
+        MoveToEx(hdc, r.left + 5, midY, NULL);
+        LineTo(hdc, r.right - 5, midY);
+        SelectObject(hdc, oldPen);
+    }
+}
+
+// Devuelve true si el clic fue consumido por el selector, para que no se
+// interprete tambien como el inicio de un trazo.
+bool HitTest(int x, int y) {
+    POINT p = {x, y};
+
+    for (int i = 0; i < kColorCount; ++i) {
+        RECT r = ColorRect(i);
+        if (PtInRect(&r, p)) {
+            drawing_color.store(static_cast<int>(kColors[i]));
+            SaveConfiguration();
+            return true;
+        }
+    }
+
+    for (int i = 0; i < kThicknessCount; ++i) {
+        RECT r = ThicknessRect(i);
+        if (PtInRect(&r, p)) {
+            drawing_thickness.store(kThicknessValues[i]);
+            SaveConfiguration();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+} // namespace Toolbar
+
+// ============================================================================
+// LEYENDA DE ATAJOS DE TECLADO
+// ============================================================================
+// Los atajos del overlay solo estaban documentados en el README: desde la propia
+// aplicacion no habia forma de descubrir cual es la tecla de cada herramienta.
+// Este panel las lista mientras el overlay esta activo y se oculta con F9.
+//
+// Las filas de herramienta se generan a partir de kToolHotkeys, de modo que
+// reasignar una tecla en el .ini se refleja aqui automaticamente en vez de
+// dejar la leyenda mintiendo.
+//
+// Se dibuja en la esquina inferior izquierda para no chocar con el indicador de
+// herramienta ni con la barra de colores, que ocupan la esquina superior
+// izquierda.
+namespace ShortcutLegend {
+
+struct Entry {
+    std::wstring keys;
+    std::wstring action;
+};
+
+// Atajos que no seleccionan herramienta. El de la leyenda y el de texto se
+// formatean aparte porque dependen de su propia tecla configurable.
+struct FixedEntry {
+    const wchar_t* keys;
+    const wchar_t* action;
+};
+constexpr FixedEntry kFixedEntries[] = {
+    {L"Ctrl+Z",      L"Undo"},
+    {L"Ctrl+Y",      L"Redo"},
+    {L"Wheel",       L"Zoom region"},
+    {L"Shift+Alt+X", L"Screenshot"},
+    {L"Esc",         L"Back / exit"},
+};
+constexpr int kFixedCount =
+    static_cast<int>(sizeof(kFixedEntries) / sizeof(kFixedEntries[0]));
+
+// herramientas + Ctrl+T + los fijos + F9
+constexpr int kCount = kToolHotkeyCount + 1 + kFixedCount + 1;
+
+// Las filas se rearman solo cuando cambia alguna tecla, no en cada frame: el
+// panel se dibuja dentro del bucle de pintado.
+const std::vector<Entry>& Rows() {
+    static std::vector<Entry> cached;
+    static std::vector<int> snapshot;
+
+    std::vector<int> current;
+    current.reserve(kToolHotkeyCount + 2);
+    for (const ToolHotkey& hk : kToolHotkeys) current.push_back(hk.key->load());
+    current.push_back(hotkey_tool_text.load());
+    current.push_back(hotkey_toggle_legend.load());
+
+    if (current == snapshot && !cached.empty()) return cached;
+
+    snapshot = current;
+    cached.clear();
+    cached.reserve(kCount);
+    for (const ToolHotkey& hk : kToolHotkeys) {
+        cached.push_back(Entry{HotkeyDisplayName(hk.key->load()), hk.label});
+    }
+    cached.push_back(Entry{L"Ctrl+" + HotkeyDisplayName(hotkey_tool_text.load()),
+                           L"Text"});
+    for (const FixedEntry& fe : kFixedEntries) {
+        cached.push_back(Entry{fe.keys, fe.action});
+    }
+    cached.push_back(Entry{HotkeyDisplayName(hotkey_toggle_legend.load()),
+                           L"Hide this help"});
+    return cached;
+}
+
+constexpr int kColumns = 2;
+constexpr int kRows = (kCount + kColumns - 1) / kColumns;
+
+constexpr int kMargin = 20;         // separacion respecto al borde de pantalla
+constexpr int kPadding = 12;        // margen interior del panel
+constexpr int kRowHeight = 19;
+constexpr int kKeyWidth = 76;       // cabe "Shift+Alt+X" (62 px medidos)
+constexpr int kActionWidth = 106;   // cabe "Hide this help" / "Step number"
+constexpr int kColumnWidth = kKeyWidth + kActionWidth;
+constexpr int kColumnGap = 14;
+constexpr int kTitleHeight = 22;
+
+constexpr int kPanelWidth =
+    kPadding * 2 + kColumns * kColumnWidth + (kColumns - 1) * kColumnGap;
+constexpr int kPanelHeight = kPadding * 2 + kTitleHeight + kRows * kRowHeight;
+
+// Ni el fondo ni el texto pueden usar magenta RGB(255,0,255) ni cian
+// RGB(0,255,255): son los colores clave de LWA_COLORKEY y el panel se volveria
+// invisible justo encima de las regiones transparentes.
+constexpr COLORREF kPanelColor = RGB(18, 18, 18);
+constexpr COLORREF kBorderColor = RGB(120, 120, 120);
+constexpr COLORREF kTitleColor = RGB(255, 215, 0);
+constexpr COLORREF kKeyColor = RGB(120, 220, 120);
+constexpr COLORREF kActionColor = RGB(235, 235, 235);
+
+void Draw(HDC hdc, int screenWidth, int screenHeight) {
+    if (!show_shortcut_legend.load()) return;
+
+    // Si la pantalla es demasiado pequena para el panel se omite, en vez de
+    // dibujarlo recortado sobre el contenido.
+    if (screenWidth < kPanelWidth + kMargin * 2 ||
+        screenHeight < kPanelHeight + kMargin * 2) {
+        return;
+    }
+
+    const int left = kMargin;
+    const int top = screenHeight - kMargin - kPanelHeight;
+    RECT panel = {left, top, left + kPanelWidth, top + kPanelHeight};
+
+    ScopedBrush panelBrush(CreateSolidBrush(kPanelColor), true);
+    if (panelBrush) FillRect(hdc, &panel, panelBrush);
+
+    HPEN borderPen = GdiCache::GetPenCached(kBorderColor, 1);
+    HPEN oldPen = (HPEN)SelectObject(hdc, borderPen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, panel.left, panel.top, panel.right, panel.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+
+    const int prevBkMode = SetBkMode(hdc, TRANSPARENT);
+
+    HFONT oldFont = (HFONT)SelectObject(hdc, GdiCache::hCachedFontIndicator);
+    SetTextColor(hdc, kTitleColor);
+    RECT titleRect = {left + kPadding, top + kPadding,
+                      panel.right - kPadding, top + kPadding + kTitleHeight};
+    DrawTextW(hdc, L"SHORTCUTS", -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(hdc, GdiCache::hCachedFont);
+    const std::vector<Entry>& rows = Rows();
+    const int firstRowY = top + kPadding + kTitleHeight;
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+        // Se rellena por columnas: la primera se completa antes de pasar a la
+        // segunda, que es como se lee una lista de atajos.
+        const int column = i / kRows;
+        const int row = i % kRows;
+        const int cellX = left + kPadding + column * (kColumnWidth + kColumnGap);
+        const int cellY = firstRowY + row * kRowHeight;
+
+        RECT keyRect = {cellX, cellY, cellX + kKeyWidth, cellY + kRowHeight};
+        SetTextColor(hdc, kKeyColor);
+        DrawTextW(hdc, rows[i].keys.c_str(), -1, &keyRect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        RECT actionRect = {cellX + kKeyWidth, cellY,
+                           cellX + kColumnWidth, cellY + kRowHeight};
+        SetTextColor(hdc, kActionColor);
+        DrawTextW(hdc, rows[i].action.c_str(), -1, &actionRect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectObject(hdc, oldFont);
+    SetBkMode(hdc, prevBkMode);
+}
+
+} // namespace ShortcutLegend
+
+// Rectangulo que ocupa un elemento ya dibujado. Se usa para descartarlo cuando
+// no toca la zona que se esta repintando: sin esto, un pixelado fuera de la zona
+// seguiria costando un DC, un bitmap y dos StretchBlt por frame, porque el
+// recorte de GDI no llega a evitar el trabajo sobre el DC temporal.
+RECT DrawingElementBounds(const DrawingElement& e) {
+    RECT r;
+    if (e.tool_type == DrawingTool::Pen) {
+        if (e.points.empty()) return RECT{0, 0, 0, 0};
+        LONG minX = e.points[0].x, maxX = e.points[0].x;
+        LONG minY = e.points[0].y, maxY = e.points[0].y;
+        for (const POINT& p : e.points) {
+            minX = std::min<LONG>(minX, p.x);
+            maxX = std::max<LONG>(maxX, p.x);
+            minY = std::min<LONG>(minY, p.y);
+            maxY = std::max<LONG>(maxY, p.y);
+        }
+        r = RECT{minX, minY, maxX, maxY};
+    } else {
+        r = RECT{std::min(e.x1, e.x2), std::min(e.y1, e.y2),
+                 std::max(e.x1, e.x2), std::max(e.y1, e.y2)};
+    }
+    // Margen holgado a proposito: el marcador de paso dibuja un circulo de hasta
+    // 40 px de radio alrededor de su punto, y las flechas sobresalen del
+    // segmento. Descartar de menos solo cuesta tiempo; de mas deja restos.
+    const int pad = std::max(e.thickness * 4, 48);
+    InflateRect(&r, pad, pad);
+    return r;
 }
 
 // Función para dibujar el overlay
-void DrawOverlay(HDC hdc, int width, int height) {
+//
+// paintRect es la zona invalidada (ps.rcPaint). Todo el dibujado se recorta a
+// ella y solo esa zona se vuelca a la ventana, de modo que arrastrar el raton
+// deja de costar un repintado del escritorio virtual entero.
+void DrawOverlay(HDC hdc, int width, int height, const RECT& paintRect) {
+    // Este frame lee zoom_text, screenRectangles, drawing_elements,
+    // clipboard_images y gif_elements, todos objetos no atomicos compartidos con
+    // el hilo principal. Se toma el candado una sola vez por frame.
+    std::lock_guard<std::mutex> annotationLock(g_annotationMutex);
+
     // Configurar transparencia para que el magenta (255, 0, 255) y cian (0, 255, 255) sean completamente transparentes
-    if (hCurrentOverlay) {
+    //
+    // W2.3: esta llamada se hacia en cada frame, obligando a DWM a reevaluar toda
+    // la superficie layered aunque nada hubiera cambiado. Ahora solo se llama
+    // cuando el color clave o la opacidad efectivamente cambian.
+    if (hCurrentOverlay.load()) {
         // Usar LWA_COLORKEY para hacer transparentes tanto el magenta como el cian
         // El overlay negro tendrá la opacidad configurada por el usuario
         int userOpacity = overlay_opacity.load();
@@ -2081,18 +3865,58 @@ void DrawOverlay(HDC hdc, int width, int height) {
         // Nota: LWA_COLORKEY solo soporta un color a la vez, pero podemos usar el cian
         // que es el color que se usa cuando drawing_active es true
         COLORREF transparentColor = drawing_active.load() ? RGB(0, 255, 255) : RGB(255, 0, 255);
-        SetLayeredWindowAttributes(hCurrentOverlay, transparentColor, userOpacity, LWA_COLORKEY | LWA_ALPHA);
+
+        // La cache incluye el handle a proposito. El overlay se crea y se
+        // destruye en cada activacion, y la ventana nueva nace solo con
+        // LWA_ALPHA, sin color clave. Comparando unicamente color y opacidad,
+        // los valores cacheados de la activacion anterior seguian coincidiendo
+        // y la llamada se omitia: la ventana nueva se quedaba sin LWA_COLORKEY
+        // y el interior de la region se veia magenta en vez de transparente a
+        // partir del segundo uso.
+        HWND overlayWnd = hCurrentOverlay.load();
+        static HWND lastOverlayWindow = NULL;
+        static COLORREF lastTransparentColor = CLR_INVALID;
+        static int lastOpacity = -1;
+        if (overlayWnd != lastOverlayWindow ||
+            transparentColor != lastTransparentColor ||
+            userOpacity != lastOpacity) {
+            SetLayeredWindowAttributes(overlayWnd, transparentColor,
+                                       static_cast<BYTE>(userOpacity),
+                                       LWA_COLORKEY | LWA_ALPHA);
+            lastOverlayWindow = overlayWnd;
+            lastTransparentColor = transparentColor;
+            lastOpacity = userOpacity;
+        }
     }
-    
-    // Crear DC de memoria para doble buffering
-    ScopedDC hMemDC(CreateCompatibleDC(hdc), true);
-    if (!hMemDC) return; // Verificar que se creó correctamente
-    
-    ScopedBitmap hBitmap(CreateCompatibleBitmap(hdc, width, height));
-    if (!hBitmap) return; // Verificar que se creó correctamente
-    
-    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
-    
+
+    // Back buffer cacheado. Antes se creaba y destruia un DC y un bitmap de
+    // pantalla completa en CADA frame (~8 MB en 1080p, ~33 MB en 4K).
+    HDC hMemDC = AcquireOverlayBackBuffer(hdc, width, height);
+    if (!hMemDC) return;
+
+    // Zona a repintar. El back buffer conserva el frame anterior, asi que lo que
+    // quede fuera del recorte sigue siendo valido... salvo si el buffer se acaba
+    // de crear, en cuyo caso su contenido es basura y hay que pintarlo entero.
+    RECT requested = paintRect;
+    const RECT fullScreenRect = {0, 0, width, height};
+    if (g_overlayBackBufferIsFresh) {
+        requested = fullScreenRect;
+        g_overlayBackBufferIsFresh = false;
+    }
+    // Destino distinto de las fuentes: IntersectRect no garantiza que se pueda
+    // pasar el mismo RECT como entrada y salida.
+    RECT dirty = {0, 0, 0, 0};
+    if (!IntersectRect(&dirty, &requested, &fullScreenRect)) {
+        return; // nada que pintar
+    }
+
+    // Recortar TODO el dibujado a la zona sucia. GDI descarta por su cuenta lo
+    // que cae fuera, incluido el FillRect del fondo de pantalla completa, que es
+    // el que dominaba el coste por frame.
+    //
+    // Va por RAII porque mas abajo hay returns tempranos (fallos al crear pincel
+    // o lapiz) que dejarian el back buffer recortado para siempre.
+    ScopedClipRegion clipGuard(hMemDC, dirty);
             // Dibujar overlay negro en toda la pantalla (usando cache optimizado)
     RECT fullRect = {0, 0, width, height};
         FillRect(hMemDC, &fullRect, GdiCache::hOverlayBrush);
@@ -2149,669 +3973,61 @@ void DrawOverlay(HDC hdc, int width, int height) {
         int zoomX = centerX - zoomedWidth / 2;
         int zoomY = centerY - zoomedHeight / 2;
         
-        // Debug: mostrar información del zoom
-        wchar_t debugMsg[256];
-        swprintf_s(debugMsg, L"DEBUG: Zoom active - Original: %dx%d, Zoom: %.2f, Zoomed: %dx%d\n", 
-                   originalWidth, originalHeight, zoom, zoomedWidth, zoomedHeight);
-        OutputDebugStringW(debugMsg);
-        
+        // Debug del zoom: solo en compilaciones de depuracion. Antes se emitia
+        // en CADA frame, y OutputDebugStringW toma un mutex global del sistema.
+        #ifdef DEBUG_BUILD
+        {
+            wchar_t debugMsg[256];
+            swprintf_s(debugMsg, L"DEBUG: Zoom active - Original: %dx%d, Zoom: %.2f, Zoomed: %dx%d\n",
+                       originalWidth, originalHeight, zoom, zoomedWidth, zoomedHeight);
+            OutputDebugStringW(debugMsg);
+        }
+        #endif
         // Primero dibujar un fondo blanco sólido para el zoom (brillo normal)
         RECT zoomRect = {zoomX, zoomY, zoomX + zoomedWidth, zoomY + zoomedHeight};
         FillRect(hMemDC, &zoomRect, GdiCache::hWhiteBrush);
         
-        // Debug: verificar que el StretchBlt funcione
         // IMPORTANTE: Seleccionar el bitmap antes de hacer StretchBlt
         HBITMAP hOldBitmap = (HBITMAP)SelectObject(hZoomedDC.get(), hZoomedBitmap.get());
-        
+
         BOOL stretchResult = StretchBlt(hMemDC, zoomX, zoomY, zoomedWidth, zoomedHeight,
                                        hZoomedDC.get(), 0, 0, originalWidth, originalHeight, SRCCOPY);
+        // El resultado se registraba en cada frame, incluso en el camino de exito.
+        #ifdef DEBUG_BUILD
         if (!stretchResult) {
             wchar_t errorMsg[256];
-            swprintf_s(errorMsg, L"DEBUG: StretchBlt failed - Error: %d\n", GetLastError());
+            swprintf_s(errorMsg, L"DEBUG: StretchBlt failed - Error: %d\n", (int)GetLastError());
             OutputDebugStringW(errorMsg);
-        } else {
-            OutputDebugStringW(L"DEBUG: StretchBlt exitoso\n");
         }
-        
+        #else
+        (void)stretchResult;
+        #endif
         // Restaurar el bitmap anterior
         SelectObject(hZoomedDC.get(), hOldBitmap);
         
-        // Dibujar texto debajo de la región con zoom
-        if (!zoom_text.empty()) {
-            // Usar fuente cacheada para mejor performance
-            HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFontZoom);
-            
-            // Color del texto
-            SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco
-            SetBkMode(hMemDC, TRANSPARENT); // Fondo transparente
-            
-            // Calcular tamaño del texto para ajustar el textbox dinámicamente
-            SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, zoom_text);
-            
-            // Calcular dimensiones del textbox ajustado al contenido más ancho
-            int textBoxWidth = 100; // Ancho mínimo para estabilidad
-            
-            // Calcular el ancho máximo de todas las líneas (optimizado)
-            std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(zoom_text);
-            for (const auto& line : lines) {
-                if (!line.content.empty()) {
-                    SIZE widthLineSize = GdiCache::GetTextSizeCached(hMemDC, line.content);
-                    textBoxWidth = std::max(textBoxWidth, (int)(widthLineSize.cx + 40)); // +40px de padding para seguridad
-                }
-            }
-            
-            // Asegurar ancho mínimo y máximo para estabilidad (optimizado)
-            textBoxWidth = std::clamp(textBoxWidth, 100, 1200); // Mínimo 100px, máximo 1200px
-            
-            // Calcular altura basada en el número de líneas (comentado por no utilizado)
-            // int numLines = 1;
-            // size_t newlineCount = 0;
-            // size_t countPos = 0;
-            // while ((countPos = zoom_text.find(L'\n', countPos)) != std::wstring::npos) {
-            //     newlineCount++;
-            //     countPos++;
-            // }
-            // numLines = (int)(newlineCount + 1);
-            
-            // int totalLineHeight = 20; // Variable no utilizada
-            // int textBoxHeight = (int)(numLines * totalLineHeight + 10); // Variable no utilizada
-            
-            // Centrar el textbox debajo de la región con zoom
-            int textBoxX = zoomX + (zoomedWidth - textBoxWidth) / 2;
-            int textBoxY = zoomY + zoomedHeight + 5;
-            
-            // Posición del texto (centrado en el textbox ajustado)
-            // RECT textRect = {textBoxX + 10, textBoxY + 5, textBoxX + textBoxWidth - 10, textBoxY + textBoxHeight - 5}; // Variable no utilizada
-            
-            // Dibujar texto base primero (siempre estable) - manejo manual de saltos de línea
-            std::wstring currentText = zoom_text;
-            // int currentY = textBoxY + 5; // Variable no utilizada
-            // int lineHeight = 20; // Variable no utilizada
-            
-                        // Función simple para dibujar texto línea por línea (optimizada)
-            auto drawTextSimple = [&](int startY) {
-                if (zoom_text.empty()) return;
-                
-                std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(zoom_text);
-                int currentY = startY;
-                int lineHeight = 20; // Altura de cada línea (se ajusta dinámicamente para imágenes)
-                
-                for (const auto& line : lines) {
-                    // Verificar si la línea contiene un marcador de imagen o GIF
-                    if (line.content.find(L"[IMAGE_") != std::wstring::npos) {
-                        // Extraer el índice de la imagen del marcador
-                        size_t imageStart = line.content.find(L"[IMAGE_");
-                        size_t imageEnd = line.content.find(L"]", imageStart);
-                        if (imageStart != std::wstring::npos && imageEnd != std::wstring::npos) {
-                            std::wstring imageIndexStr = line.content.substr(imageStart + 7, imageEnd - imageStart - 7);
-                            try {
-                                int imageIndex = std::stoi(imageIndexStr);
-                                if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                    // Dibujar la imagen (usando cache optimizado)
-                                    HBITMAP hImage = clipboard_images[imageIndex].get();
-                                    SIZE imgSize = GdiCache::GetBitmapSizeCached(hImage);
-                                    
-                                    if (imgSize.cx > 0 && imgSize.cy > 0) {
-                                        int imgWidth = imgSize.cx;
-                                        int imgHeight = imgSize.cy;
-                                        
-                                        // Centrar la imagen horizontalmente
-                                        int imgX = textBoxX + (textBoxWidth - imgWidth) / 2;
-                                        
-                                        // Crear DC temporal para la imagen
-                                        HDC hdcImage = CreateCompatibleDC(hMemDC);
-                                        if (hdcImage) {
-                                            HBITMAP hOldImageBitmap = (HBITMAP)SelectObject(hdcImage, hImage);
-                                            
-                                            // Dibujar la imagen en su posición
-                                            BitBlt(hMemDC, imgX, currentY, imgWidth, imgHeight, hdcImage, 0, 0, SRCCOPY);
-                                            
-                                            // Limpiar
-                                            SelectObject(hdcImage, hOldImageBitmap);
-                                            DeleteDC(hdcImage);
-                                        }
-                                        
-                                        // Avanzar la posición Y según la altura de la imagen + espaciado
-                                        currentY += imgHeight + 5;
-                                    }
-                                }
-                            } catch (...) {
-                                // Si hay error, continuar con la siguiente línea
-                                currentY += lineHeight;
-                            }
-                        } else {
-                            // Si no se puede parsear el marcador, continuar
-                            currentY += lineHeight;
-                        }
-                    } else if (line.content.find(L"[GIF_") != std::wstring::npos) {
-                        // Extraer el índice del GIF del marcador
-                        size_t gifStart = line.content.find(L"[GIF_");
-                        size_t gifEnd = line.content.find(L"]", gifStart);
-                        if (gifStart != std::wstring::npos && gifEnd != std::wstring::npos) {
-                            std::wstring gifIndexStr = line.content.substr(gifStart + 5, gifEnd - gifStart - 5);
-                            try {
-                                int gifIndex = std::stoi(gifIndexStr);
-                                if (gifIndex >= 0 && gifIndex < static_cast<int>(gif_elements.size()) && !gif_elements[gifIndex].frames.empty()) {
-                                    // Dibujar el frame actual del GIF (usando cache optimizado)
-                                    const GifElement& gif = gif_elements[gifIndex];
-                                    HBITMAP hGifFrame = gif.frames[gif.current_frame].get();
-                                    SIZE gifSize = GdiCache::GetBitmapSizeCached(hGifFrame);
-                                    
-                                    if (gifSize.cx > 0 && gifSize.cy > 0) {
-                                        int gifWidth = gif.width;
-                                        int gifHeight = gif.height;
-                                        
-                                        // Centrar el GIF horizontalmente
-                                        int gifX = textBoxX + (textBoxWidth - gifWidth) / 2;
-                                        
-                                        // Crear DC temporal para el GIF
-                                        HDC hdcGif = CreateCompatibleDC(hMemDC);
-                                        if (hdcGif) {
-                                            HBITMAP hOldGifBitmap = (HBITMAP)SelectObject(hdcGif, hGifFrame);
-                                            
-                                            // Dibujar el frame actual del GIF en su posición
-                                            BitBlt(hMemDC, gifX, currentY, gifWidth, gifHeight, hdcGif, 0, 0, SRCCOPY);
-                                            
-                                            // Limpiar
-                                            SelectObject(hdcGif, hOldGifBitmap);
-                                            DeleteDC(hdcGif);
-                                        }
-                                        
-                                        // Avanzar la posición Y según la altura del GIF + espaciado
-                                        currentY += gifHeight + 5;
-                                    }
-                                }
-                            } catch (...) {
-                                // Si hay error, continuar con la siguiente línea
-                                currentY += lineHeight;
-                            }
-                        } else {
-                            // Si no se puede parsear el marcador, continuar
-                            currentY += lineHeight;
-                        }
-                    } else if (!line.content.empty()) {
-                        // Calcular si esta línea tiene texto seleccionado
-                        bool hasSelection = false;
-                        int selectionStart = -1;
-                        int selectionEnd = -1;
-                        
-                        if (text_selection_active.load()) {
-                            int start = std::min(text_selection_start.load(), text_selection_end.load());
-                            int end = std::max(text_selection_start.load(), text_selection_end.load());
-                            
-                            // Verificar si esta línea tiene caracteres específicos seleccionados
-                            int lineStart = (int)line.startPos;
-                            int lineEnd = (int)line.endPos;
-                            
-                            // Solo seleccionar si hay superposición real
-                            if (start < lineEnd && end > lineStart) {
-                                hasSelection = true;
-                                selectionStart = std::max(0, start - lineStart);
-                                selectionEnd = std::min((int)line.content.length(), end - lineStart);
-                                
-                                // Solo seleccionar si hay caracteres realmente seleccionados
-                                if (selectionStart >= selectionEnd) {
-                                    hasSelection = false;
-                                }
-                            }
-                        }
-                        
-                        if (hasSelection && selectionStart < selectionEnd) {
-                            // Dibujar texto con selección parcial
-                            // Primero dibujar el texto normal
-                            RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                            DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
-                            
-                            // Ahora dibujar el fondo de selección solo para los caracteres seleccionados
-                            if (selectionStart < (int)line.content.length()) {
-                                // Calcular posición X del inicio de la selección
-                                std::wstring textBeforeSelection = line.content.substr(0, selectionStart);
-                                SIZE textBeforeSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeSelection);
-                                
-                                // Calcular posición X del final de la selección
-                                std::wstring textInSelection = line.content.substr(selectionStart, selectionEnd - selectionStart);
-                                SIZE textInSelectionSize = GdiCache::GetTextSizeCached(hMemDC, textInSelection);
-                                
-                                // Dibujar fondo azul solo para los caracteres seleccionados
-                                RECT selectionRect = {
-                                    textBoxX + 10 + (int)textBeforeSize.cx, 
-                                    currentY, 
-                                    textBoxX + 10 + (int)textBeforeSize.cx + (int)textInSelectionSize.cx, 
-                                    currentY + lineHeight
-                                };
-                                
-                                FillRect(hMemDC, &selectionRect, GdiCache::hSelectionBrush);
-                                
-                                // Redibujar solo el texto seleccionado en blanco sobre el fondo azul
-                                SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco sobre fondo azul
-                                RECT selectedTextRect = {
-                                    textBoxX + 10 + (int)textBeforeSize.cx, 
-                                    currentY, 
-                                    textBoxX + 10 + (int)textBeforeSize.cx + (int)textInSelectionSize.cx, 
-                                    currentY + lineHeight
-                                };
-                                DrawTextW(hMemDC, textInSelection.c_str(), -1, &selectedTextRect, DT_LEFT | DT_TOP);
-                                
-                                // Restaurar color del texto normal
-                                SetTextColor(hMemDC, RGB(255, 255, 255));
-                                            }
-                                        } else {
-                            // Dibujar texto normal sin selección
-                            RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                            DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
-                                        }
-                        
-                        currentY += lineHeight; // Línea de texto normal
-                                } else {
-                        // Línea vacía - usar altura estándar para el texto
-                        currentY += lineHeight; // Altura estándar para línea vacía
-                            }
-                        }
-            };
-            
-            // Dibujar texto simple línea por línea (ahora incluye el renderizado de imágenes mediante marcadores)
-            drawTextSimple(textBoxY + 5);
-            // Las imágenes se renderizan automáticamente mediante los marcadores [IMAGE_X] en drawTextSimple
-            
-            // CURSOR SIMPLE - Aparece al final del texto como una línea vertical
-            if (text_input_mode.load() && text_cursor_visible.load()) {
-                // Calcular posición del cursor simulando exactamente el mismo renderizado que el texto
-                int cursorX = textBoxX + 10; // Inicio del texto + padding
-                int cursorY = textBoxY + 5;
-                
-                if (text_cursor_pos.load() > 0) {
-                    // Simular el renderizado exacto hasta la posición del cursor
-                    std::wstring currentText = zoom_text.substr(0, text_cursor_pos.load());
-                    int currentY = textBoxY + 5;
-                    int lineHeight = 20;
-                    size_t pos = 0;
-                    size_t targetPos = text_cursor_pos.load();
-                    bool foundCursor = false;
-                    
-                    // Procesar el texto línea por línea igual que drawTextSimple
-                    while (pos < currentText.length() && !foundCursor) {
-                        // Buscar el próximo salto de línea
-                        size_t nextNewline = currentText.find(L'\n', pos);
-                        if (nextNewline == std::wstring::npos) {
-                            nextNewline = currentText.length();
-                        }
-                        
-                        // Verificar si el cursor está en esta línea
-                        if (targetPos >= pos && targetPos <= nextNewline) {
-                            // El cursor está en esta línea
-                            foundCursor = true;
-                            
-                            // Obtener la línea actual
-                            std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
-                            
-                            // Verificar si la línea contiene un marcador de imagen o GIF
-                            if (currentLine.find(L"[IMAGE_") != std::wstring::npos) {
-                                // Esta línea tiene una imagen, obtener su altura
-                                size_t imageStart = currentLine.find(L"[IMAGE_");
-                                size_t imageEnd = currentLine.find(L"]", imageStart);
-                                if (imageStart != std::wstring::npos && imageEnd != std::wstring::npos) {
-                                    std::wstring imageIndexStr = currentLine.substr(imageStart + 7, imageEnd - imageStart - 7);
-                                    try {
-                                        int imageIndex = std::stoi(imageIndexStr);
-                                        if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                            HBITMAP hImage = clipboard_images[imageIndex].get();
-                                            BITMAP bm;
-                                            if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
-                                                // El cursor debe estar después de la imagen
-                                                cursorY = currentY + bm.bmHeight + 5;
-                                                cursorX = textBoxX + 10; // Al inicio de la siguiente línea
-                                            }
-                                        }
-                                    } catch (...) {
-                                        cursorY = currentY + 20;
-                                        cursorX = textBoxX + 10;
-                                    }
-                                }
-                            } else if (currentLine.find(L"[GIF_") != std::wstring::npos) {
-                                // Esta línea tiene un GIF, obtener su altura
-                                size_t gifStart = currentLine.find(L"[GIF_");
-                                size_t gifEnd = currentLine.find(L"]", gifStart);
-                                if (gifStart != std::wstring::npos && gifEnd != std::wstring::npos) {
-                                    std::wstring gifIndexStr = currentLine.substr(gifStart + 5, gifEnd - gifStart - 5);
-                                    try {
-                                        int gifIndex = std::stoi(gifIndexStr);
-                                        if (gifIndex >= 0 && gifIndex < static_cast<int>(gif_elements.size()) && !gif_elements[gifIndex].frames.empty()) {
-                                            // El cursor debe estar después del GIF
-                                            cursorY = currentY + gif_elements[gifIndex].height + 5;
-                                            cursorX = textBoxX + 10; // Al inicio de la siguiente línea
-                                        }
-                                    } catch (...) {
-                                        cursorY = currentY + 20;
-                                        cursorX = textBoxX + 10;
-                                    }
-                                }
-                            } else {
-                                // Esta línea es texto normal
-                                std::wstring textBeforeCursor = currentLine.substr(0, targetPos - pos);
-                        SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeCursor);
-                                cursorX = textBoxX + 10 + (int)textSize.cx;
-                                cursorY = currentY;
-                            }
-                        } else {
-                            // El cursor no está en esta línea, solo avanzar la posición Y
-                            std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
-                            
-                            if (currentLine.find(L"[IMAGE_") != std::wstring::npos) {
-                                // Esta línea tiene una imagen
-                                size_t imageStart = currentLine.find(L"[IMAGE_");
-                                size_t imageEnd = currentLine.find(L"]", imageStart);
-                                if (imageStart != std::wstring::npos && imageEnd != std::wstring::npos) {
-                                    std::wstring imageIndexStr = currentLine.substr(imageStart + 7, imageEnd - imageStart - 7);
-                                    try {
-                                        int imageIndex = std::stoi(imageIndexStr);
-                                        if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                            HBITMAP hImage = clipboard_images[imageIndex].get();
-                                            BITMAP bm;
-                                            if (GetObject(hImage, sizeof(BITMAP), &bm) > 0) {
-                                                // IMPORTANTE: Actualizar currentY con la altura real de la imagen
-                                            currentY += 50 + 5; // Altura fija temporal para imágenes
-                                            } else {
-                                                currentY += lineHeight; // Fallback si no se puede obtener altura
-                                            }
-                                        } else {
-                                            currentY += lineHeight; // Fallback si no se encuentra la imagen
-                                        }
-                                    } catch (...) {
-                                        currentY += lineHeight; // Fallback si hay error
-                                    }
-                                } else {
-                                    currentY += lineHeight; // Fallback si no se puede parsear
-                                }
-                            } else if (currentLine.find(L"[GIF_") != std::wstring::npos) {
-                                // Esta línea tiene un GIF
-                                size_t gifStart = currentLine.find(L"[GIF_");
-                                size_t gifEnd = currentLine.find(L"]", gifStart);
-                                if (gifStart != std::wstring::npos && gifEnd != std::wstring::npos) {
-                                    std::wstring gifIndexStr = currentLine.substr(gifStart + 5, gifEnd - gifStart - 5);
-                                    try {
-                                        int gifIndex = std::stoi(gifIndexStr);
-                                        if (gifIndex >= 0 && gifIndex < static_cast<int>(gif_elements.size()) && !gif_elements[gifIndex].frames.empty()) {
-                                            // IMPORTANTE: Actualizar currentY con la altura real del GIF
-                                            currentY += gif_elements[gifIndex].height + 5;
-                                        } else {
-                                            currentY += lineHeight; // Fallback si no se encuentra el GIF
-                                        }
-                                    } catch (...) {
-                                        currentY += lineHeight; // Fallback si hay error
-                                    }
-                                } else {
-                                    currentY += lineHeight; // Fallback si no se puede parsear
-                                }
-                            } else {
-                                // Línea de texto normal
-                                currentY += lineHeight;
-                            }
-                        }
-                        
-                        // Mover a la siguiente línea
-                        pos = nextNewline + 1;
-                    }
-                }
-                
-                // Dibujar cursor vertical simple en la posición correcta (usando cache optimizado)
-                HPEN hOldPen = (HPEN)SelectObject(hMemDC, GdiCache::hCursorPen);
-                MoveToEx(hMemDC, cursorX, cursorY, NULL);
-                LineTo(hMemDC, cursorX, cursorY + 20); // Altura fija de 20px por línea
-                SelectObject(hMemDC, hOldPen);
-            }
-            
-            // Restaurar fuente (no es necesario con cache estático)
-            // SelectObject(hMemDC, hOldCachedFontZoom);
-            // DeleteObject(hCachedFontZoom);
-        }
+        // Dibujar texto debajo de la región con zoom.
+        // El cuadro se centra horizontalmente bajo la región ampliada.
+        TextRender::RenderAnnotationText(hMemDC, GdiCache::hCachedFontZoom,
+                                         zoomX, zoomY + zoomedHeight + 5,
+                                         zoomedWidth);
     }
     
-    // Dibujar texto cuando no hay zoom pero sí está en modo texto
-    if (!zoom_active.load() && text_input_mode.load() && !zoom_text.empty()) {
-        // Usar fuente cacheada para mejor performance
-        HFONT hOldFont = (HFONT)SelectObject(hMemDC, GdiCache::hCachedFont);
-        
-        // Color del texto
-        SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco
-        SetBkMode(hMemDC, TRANSPARENT); // Fondo transparente
-        
-        // Calcular tamaño del texto para ajustar el textbox dinámicamente
-        SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, zoom_text);
-        
-        // Calcular dimensiones del textbox ajustado al contenido más ancho
-        int textBoxWidth = 100; // Ancho mínimo para estabilidad
-        
-        // Calcular el ancho máximo de todas las líneas (optimizado)
-        std::vector<GdiCache::TextLine> lines = GdiCache::ProcessTextLines(zoom_text);
-        for (const auto& line : lines) {
-            if (!line.content.empty()) {
-                SIZE widthLineSize = GdiCache::GetTextSizeCached(hMemDC, line.content);
-                textBoxWidth = std::max(textBoxWidth, (int)(widthLineSize.cx + 40)); // +40px de padding para seguridad
-            }
-        }
-        
-        // Asegurar ancho mínimo y máximo para estabilidad
-        textBoxWidth = std::max(textBoxWidth, 100);  // Mínimo 100px
-        textBoxWidth = std::min(textBoxWidth, 1200); // Máximo 1200px para mostrar texto largo completo
-        
-        // Calcular altura basada en el número de líneas
-        // Calcular altura basada en el número de líneas (comentado por no utilizado)
-        // int numLines = 1;
-        // size_t newlineCount = 0;
-        // size_t countPos = 0;
-        // while ((countPos = zoom_text.find(L'\n', countPos)) != std::string::npos) {
-        //     newlineCount++;
-        //     countPos++;
-        // }
-        // numLines = (int)(newlineCount + 1);
-        
-        // int totalLineHeight = 20; // Variable no utilizada
-        // int textBoxHeight = (int)(numLines * totalLineHeight + 10); // Variable no utilizada
-        
-        // Posicionar el textbox debajo de la última región seleccionada
-        int textBoxX = 20;
-        int textBoxY = 20;
-        
-        // Si hay regiones, posicionar el texto debajo de la última
+    // Dibujar texto cuando no hay zoom.
+    //
+    // La condicion ya no exige text_input_mode: antes el texto desaparecia al
+    // salir del modo de edicion, mientras que en modo zoom bastaba con que el
+    // texto no estuviera vacio. Ahora ambos modos se comportan igual.
+    if (!zoom_active.load() && !zoom_text.empty()) {
+        // Debajo de la ultima region seleccionada, alineado a su borde izquierdo.
+        int anchorX = 20;
+        int anchorY = 20;
         if (!screenRectangles.empty()) {
             const auto& lastRect = screenRectangles.back();
-            textBoxX = lastRect.x1;
-            textBoxY = lastRect.y2 + 5; // 5px debajo de la región
+            anchorX = lastRect.x1;
+            anchorY = lastRect.y2 + 5;
         }
-        
-        // Posición del texto (centrado en el textbox ajustado)
-        // RECT textRect = {textBoxX + 10, textBoxY + 5, textBoxX + textBoxWidth - 10, textBoxY + textBoxHeight - 5}; // Variable no utilizada
-        
-        // Dibujar texto línea por línea (optimizado) - usando variable existente
-        // lines ya está declarada arriba
-        int currentY = textBoxY + 5;
-        int lineHeight = 20; // Altura de cada línea
-        
-        for (const auto& line : lines) {
-            // Calcular si esta línea tiene texto seleccionado
-            bool hasSelection = false;
-            int selectionStart = -1;
-            int selectionEnd = -1;
-            
-            if (text_selection_active.load()) {
-                int start = std::min(text_selection_start.load(), text_selection_end.load());
-                int end = std::max(text_selection_start.load(), text_selection_end.load());
-                
-                // Verificar si esta línea tiene caracteres específicos seleccionados
-                int lineStart = (int)line.startPos;
-                int lineEnd = (int)line.endPos;
-                
-                // Solo seleccionar si hay superposición real
-                if (start < lineEnd && end > lineStart) {
-                    hasSelection = true;
-                    selectionStart = std::max(0, start - lineStart);
-                    selectionEnd = std::min((int)line.content.length(), end - lineStart);
-                    
-                    // Solo seleccionar si hay caracteres realmente seleccionados
-                    if (selectionStart >= selectionEnd) {
-                        hasSelection = false;
-                    }
-                }
-            }
-            
-            if (hasSelection && selectionStart < selectionEnd) {
-                // Dibujar texto con selección parcial
-                // Primero dibujar el texto normal
-                RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
-                
-                // Ahora dibujar el fondo de selección solo para los caracteres seleccionados
-                if (selectionStart < (int)line.content.length()) {
-                    // Calcular posición X del inicio de la selección
-                    std::wstring textBeforeSelection = line.content.substr(0, selectionStart);
-                    SIZE textBeforeSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeSelection);
-                    
-                    // Calcular posición X del final de la selección
-                    std::wstring textInSelection = line.content.substr(selectionStart, selectionEnd - selectionStart);
-                    SIZE textInSelectionSize = GdiCache::GetTextSizeCached(hMemDC, textInSelection);
-                    
-                    // Dibujar fondo azul solo para los caracteres seleccionados
-                    RECT selectionRect = {
-                        textBoxX + 10 + (int)textBeforeSize.cx, 
-                        currentY, 
-                        textBoxX + 10 + (int)textBeforeSize.cx + (int)textInSelectionSize.cx, 
-                        currentY + lineHeight
-                    };
-                    
-                    FillRect(hMemDC, &selectionRect, GdiCache::hSelectionBrush);
-                    
-                    // Redibujar solo el texto seleccionado en blanco sobre el fondo azul
-                    SetTextColor(hMemDC, RGB(255, 255, 255)); // Texto blanco sobre fondo azul
-                    RECT selectedTextRect = {
-                        textBoxX + 10 + (int)textBeforeSize.cx, 
-                        currentY, 
-                        textBoxX + 10 + (int)textBeforeSize.cx + (int)textInSelectionSize.cx, 
-                        currentY + lineHeight
-                    };
-                    DrawTextW(hMemDC, textInSelection.c_str(), -1, &selectedTextRect, DT_LEFT | DT_TOP);
-                    
-                    // Restaurar color del texto normal
-                    SetTextColor(hMemDC, RGB(255, 255, 255));
-                                    }
-                                } else {
-                // Dibujar texto normal sin selección
-                RECT lineRect = {textBoxX + 10, currentY, textBoxX + textBoxWidth - 10, currentY + lineHeight};
-                DrawTextW(hMemDC, line.content.c_str(), -1, &lineRect, DT_LEFT | DT_TOP);
-                }
-                
-            currentY += lineHeight;
-        }
-        
-        // CURSOR SIMPLE - Aparece al final del texto como una línea vertical
-        if (text_cursor_visible.load()) {
-            // Calcular posición del cursor simulando exactamente el mismo renderizado que el texto
-            int cursorX = textBoxX + 10; // Inicio del texto + padding
-            int cursorY = textBoxY + 5;
-            
-            if (text_cursor_pos.load() > 0) {
-                // Simular el renderizado exacto hasta la posición del cursor
-                std::wstring currentText = zoom_text.substr(0, text_cursor_pos.load());
-                int currentY = textBoxY + 5;
-                int lineHeight = 20;
-                size_t pos = 0;
-                size_t targetPos = text_cursor_pos.load();
-                bool foundCursor = false;
-                
-                // Procesar el texto línea por línea igual que drawTextSimple
-                while (pos < currentText.length() && !foundCursor) {
-                    // Buscar el próximo salto de línea
-                    size_t nextNewline = currentText.find(L'\n', pos);
-                    if (nextNewline == std::wstring::npos) {
-                        nextNewline = currentText.length();
-                    }
-                    
-                    // Verificar si el cursor está en esta línea
-                    if (targetPos >= pos && targetPos <= nextNewline) {
-                        // El cursor está en esta línea
-                        foundCursor = true;
-                        
-                        // Obtener la línea actual
-                        std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
-                        
-                        // Verificar si la línea contiene un marcador de imagen
-                        if (currentLine.find(L"[IMAGE_") != std::wstring::npos) {
-                            // Esta línea tiene una imagen, obtener su altura
-                            size_t imageStart = currentLine.find(L"[IMAGE_");
-                            size_t imageEnd = currentLine.find(L"]", imageStart);
-                            if (imageStart != std::wstring::npos && imageEnd != std::wstring::npos) {
-                                std::wstring imageIndexStr = currentLine.substr(imageStart + 7, imageEnd - imageStart - 7);
-                                try {
-                                    int imageIndex = std::stoi(imageIndexStr);
-                                    if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                        HBITMAP hImage = clipboard_images[imageIndex].get();
-                                        SIZE imgSize = GdiCache::GetBitmapSizeCached(hImage);
-                                        if (imgSize.cx > 0 && imgSize.cy > 0) {
-                                            // El cursor debe estar después de la imagen
-                                            cursorY = currentY + imgSize.cy + 5;
-                                            cursorX = textBoxX + 10; // Al inicio de la siguiente línea
-                                        }
-                                    }
-                                } catch (...) {
-                                    cursorY = currentY + 20;
-                                    cursorX = textBoxX + 10;
-                                }
-                            }
-                        } else {
-                            // Esta línea es texto normal
-                            std::wstring textBeforeCursor = currentLine.substr(0, targetPos - pos);
-                            SIZE textSize = GdiCache::GetTextSizeCached(hMemDC, textBeforeCursor);
-                            cursorX = textBoxX + 10 + (int)textSize.cx;
-                            cursorY = currentY;
-                        }
-                    } else {
-                        // El cursor no está en esta línea, solo avanzar la posición Y
-                        std::wstring currentLine = currentText.substr(pos, nextNewline - pos);
-                        
-                        if (currentLine.find(L"[IMAGE_") != std::wstring::npos) {
-                            // Esta línea tiene una imagen
-                            size_t imageStart = currentLine.find(L"[IMAGE_");
-                            size_t imageEnd = currentLine.find(L"]", imageStart);
-                            if (imageStart != std::wstring::npos && imageEnd != std::wstring::npos) {
-                                std::wstring imageIndexStr = currentLine.substr(imageStart + 7, imageEnd - imageStart - 7);
-                                try {
-                                    int imageIndex = std::stoi(imageIndexStr);
-                                    if (imageIndex >= 0 && imageIndex < static_cast<int>(clipboard_images.size()) && clipboard_images[imageIndex]) {
-                                        HBITMAP hImage = clipboard_images[imageIndex].get();
-                                        SIZE imgSize = GdiCache::GetBitmapSizeCached(hImage);
-                                        if (imgSize.cx > 0 && imgSize.cy > 0) {
-                                            // El cursor debe estar después de la imagen
-                                            cursorY = currentY + imgSize.cy + 5;
-                                            cursorX = textBoxX + 10; // Al inicio de la siguiente línea
-                                        }
-                                    }
-                                } catch (...) {
-                                    cursorY = currentY + 20;
-                                    cursorX = textBoxX + 10;
-                                }
-                            } else {
-                                currentY += lineHeight; // Fallback si no se puede parsear
-                            }
-                        } else {
-                            // Línea de texto normal
-                            currentY += lineHeight;
-                        }
-                    }
-                    
-                    // Mover a la siguiente línea
-                    pos = nextNewline + 1;
-                }
-            }
-            
-            // Dibujar cursor vertical simple en la posición correcta (usando cache optimizado)
-            HPEN hOldPen = (HPEN)SelectObject(hMemDC, GdiCache::hCursorPen);
-            MoveToEx(hMemDC, cursorX, cursorY, NULL);
-            LineTo(hMemDC, cursorX, cursorY + 20); // Altura fija de 20px por línea
-            SelectObject(hMemDC, hOldPen);
-        }
-        
-        // Restaurar fuente (no es necesario con cache estático)
-        // SelectObject(hMemDC, hOldCachedFont);
-        // DeleteObject(hCachedFont);
+        TextRender::RenderAnnotationText(hMemDC, GdiCache::hCachedFont,
+                                         anchorX, anchorY, 0);
     }
     
     // Dibujar bordes verdes (solo si hay regiones)
@@ -2877,7 +4093,11 @@ void DrawOverlay(HDC hdc, int width, int height) {
             case DrawingTool::Arrow: toolText = L"🏹 ARROW"; break;
             case DrawingTool::Rectangle: toolText = L"🔲 RECTANGLE"; break;
             // Case 4 (Text) removed
-            case DrawingTool::Highlighter: toolText = L"🎨 HIGHLIGHTER"; break;
+            case DrawingTool::Highlighter: toolText = L"🎨 HIGHLIGHT"; break;
+            case DrawingTool::Ellipse: toolText = L"⭕ ELLIPSE"; break;
+            case DrawingTool::Pen: toolText = L"🖊️ PEN"; break;
+            case DrawingTool::Redact: toolText = L"🔒 PIXELATE"; break;
+            case DrawingTool::Step: toolText = L"①  STEP NUMBER"; break;
         }
         
         // Fondo del indicador
@@ -2902,6 +4122,9 @@ void DrawOverlay(HDC hdc, int width, int height) {
         SelectObject(hMemDC, hOldBrush);
         // DeleteObject(hIndicatorFont); // Comentado - usando cache estático
         DeleteObject(hIndicatorPen);
+
+        // Selector de color y grosor, justo debajo del indicador.
+        Toolbar::Draw(hMemDC);
     }
     
     // Mostrar indicador del modo captura
@@ -3038,11 +4261,27 @@ void DrawOverlay(HDC hdc, int width, int height) {
             case DrawingTool::Highlighter: // Resaltador
                 DrawHighlighter(hMemDC, x1, y1, x2, y2, drawing_color.load());
                 break;
+            case DrawingTool::Ellipse: // Elipse
+                DrawEllipseShape(hMemDC, x1, y1, x2, y2, drawing_color.load(),
+                                 drawing_thickness.load(), drawing_fill.load());
+                break;
+            case DrawingTool::Redact: // Pixelado
+                DrawRedaction(hMemDC, g_cleanDesktopDC, x1, y1, x2, y2,
+                              drawing_thickness.load() * 4);
+                break;
+            default:
+                break;
         }
     }
     
     // Dibujar todos los elementos de dibujo (funciona también durante el zoom)
     for (const auto& element : drawing_elements) {
+        // Los elementos que no tocan la zona repintada no se dibujan: sus pixeles
+        // ya estan en el back buffer del frame anterior.
+        RECT elementBounds = DrawingElementBounds(element);
+        RECT unused;
+        if (!IntersectRect(&unused, &elementBounds, &dirty)) continue;
+
         switch (element.tool_type) {
             case DrawingTool::Line: // Línea
                 DrawLine(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color, element.thickness);
@@ -3057,15 +4296,43 @@ void DrawOverlay(HDC hdc, int width, int height) {
             case DrawingTool::Highlighter: // Resaltador
                 DrawHighlighter(hMemDC, element.x1, element.y1, element.x2, element.y2, element.color);
                 break;
+            case DrawingTool::Ellipse: // Elipse
+                DrawEllipseShape(hMemDC, element.x1, element.y1, element.x2, element.y2,
+                                 element.color, element.thickness, element.filled);
+                break;
+            case DrawingTool::Pen: // Trazo libre
+                DrawPenStroke(hMemDC, element.points, element.color, element.thickness);
+                break;
+            case DrawingTool::Redact: // Pixelado
+                DrawRedaction(hMemDC, g_cleanDesktopDC, element.x1, element.y1,
+                              element.x2, element.y2, element.thickness * 4);
+                break;
+            case DrawingTool::Step: // Numero de paso
+                DrawStepMarker(hMemDC, element.x1, element.y1, element.step_number,
+                               element.color, element.thickness);
+                break;
+            default:
+                break;
         }
     }
+
+    // Trazo del lapiz en curso (aun no confirmado).
+    if (drawing_active.load() && current_drawing_tool.load() == DrawingTool::Pen &&
+        !pen_stroke.empty()) {
+        DrawPenStroke(hMemDC, pen_stroke, drawing_color.load(), drawing_thickness.load());
+    }
     
-    // Copiar el resultado al DC principal (doble buffering)
-    BitBlt(hdc, 0, 0, width, height, hMemDC, 0, 0, SRCCOPY);
-    
-    // Restaurar bitmap anterior
-    SelectObject(hMemDC, hOldBitmap);
-    // Los recursos se limpian automáticamente al salir del scope
+    // La leyenda va al final para quedar por encima de todo lo demas.
+    ShortcutLegend::Draw(hMemDC, width, height);
+
+    // Copiar al DC de la ventana solo la zona repintada. El recorte de hMemDC
+    // sigue activo, pero BitBlt solo aplica el del destino, asi que no estorba.
+    BitBlt(hdc, dirty.left, dirty.top,
+           dirty.right - dirty.left, dirty.bottom - dirty.top,
+           hMemDC, dirty.left, dirty.top, SRCCOPY);
+
+    // El bitmap sigue seleccionado en el back buffer cacheado; se libera en
+    // ReleaseOverlayBackBuffer al cerrar el overlay.
 }
 
 // Función para dibujar la ventana de configuración moderna
@@ -3161,12 +4428,38 @@ void DrawSettingsWindow(HWND hwnd, HDC hdc) {
     currentY += 25;
     
             // Herramientas
-        RECT toolsRect = {90, currentY, width - 50, currentY + 20};
+        // Las teclas se leen de kToolHotkeys en vez de estar escritas a mano:
+        // asi el panel no queda mintiendo cuando se reasignan en el .ini.
         SetTextColor(hMemDC, RGB(150, 150, 150)); // Gris medio
-        DrawTextW(hMemDC, L"F1 = Line | F2 = Arrow | F3 = Rectangle | F4 = Highlighter", -1, &toolsRect, DT_LEFT | DT_TOP);
-        currentY += 25;
+        for (int row = 0; row < 2; ++row) {
+            const int first = row * 4;
+            const int last = std::min(first + 4, kToolHotkeyCount);
+            if (first >= last) break;
+
+            std::wstring lineText;
+            for (int i = first; i < last; ++i) {
+                if (!lineText.empty()) lineText += L"  |  ";
+                lineText += HotkeyDisplayName(kToolHotkeys[i].key->load());
+                lineText += L" = ";
+                lineText += kToolHotkeys[i].label;
+            }
+
+            RECT toolsRect = {90, currentY, width - 50, currentY + 20};
+            DrawTextW(hMemDC, lineText.c_str(), -1, &toolsRect, DT_LEFT | DT_TOP);
+            currentY += 25;
+        }
+
         RECT toolsDescRect = {90, currentY, width - 50, currentY + 20};
-        DrawTextW(hMemDC, L"Ctrl+Z = Undo | ESC = Exit drawing mode", -1, &toolsDescRect, DT_LEFT | DT_TOP);
+        const std::wstring editText =
+            L"Ctrl+" + HotkeyDisplayName(hotkey_tool_text.load()) + L" = Text  |  "
+            L"Ctrl+Z = Undo  |  Ctrl+Y = Redo  |  ESC = Exit drawing mode";
+        DrawTextW(hMemDC, editText.c_str(), -1, &toolsDescRect, DT_LEFT | DT_TOP);
+        currentY += 25;
+        RECT legendHintRect = {90, currentY, width - 50, currentY + 20};
+        const std::wstring legendText =
+            HotkeyDisplayName(hotkey_toggle_legend.load()) +
+            L" = Show/hide the shortcut legend on the overlay";
+        DrawTextW(hMemDC, legendText.c_str(), -1, &legendHintRect, DT_LEFT | DT_TOP);
         currentY += 25;
         
         // Captura de pantalla
@@ -3503,27 +4796,45 @@ void CaptureZoomRegion(const ScreenRectangle& rect) {
     HBITMAP hOldBitmap = (HBITMAP)SelectObject(hZoomedDC.get(), hZoomedBitmap.get());
     
     // Capturar la región original de la pantalla
-    BOOL captureResult = BitBlt(hZoomedDC.get(), 0, 0, width, height, hScreenDC, rect.x1, rect.y1, SRCCOPY);
+    BOOL captureResult = BitBlt(hZoomedDC.get(), 0, 0, width, height, hScreenDC,
+                                ClientToScreenX(rect.x1), ClientToScreenY(rect.y1), SRCCOPY);
+    #ifdef DEBUG_BUILD
     if (!captureResult) {
         wchar_t errorMsg[256];
-        swprintf_s(errorMsg, L"DEBUG: Capture failed - Error: %d\n", GetLastError());
+        swprintf_s(errorMsg, L"DEBUG: Capture failed - Error: %d\n", (int)GetLastError());
         OutputDebugStringW(errorMsg);
-    } else {
-        wchar_t successMsg[256];
-        swprintf_s(successMsg, L"DEBUG: Capture successful - Region: %dx%d at (%d,%d)\n", width, height, rect.x1, rect.y1);
-        OutputDebugStringW(successMsg);
     }
-    
+    #else
+    (void)captureResult;
+    #endif
     // Restaurar el bitmap anterior
     SelectObject(hZoomedDC.get(), hOldBitmap);
     
     ReleaseDC(NULL, hScreenDC);
     
-    // Configurar centro de zoom - X centrado, Y 20% arriba del centro
+    // Configurar centro de zoom - X centrado, Y 20% arriba del centro.
+    //
+    // W3.3: se centra en el monitor donde esta la region, no en el primario. Antes
+    // se usaba SM_CYSCREEN, por lo que al ampliar una region de un monitor
+    // secundario el zoom aparecia centrado en el primario.
     zoom_center_x.store((rect.x1 + rect.x2) / 2);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    int centerY = screenHeight / 2;
-    int offsetY = (int)(centerY * 0.2); // 20% arriba del centro
+
+    POINT regionCenter = {ClientToScreenX((rect.x1 + rect.x2) / 2),
+                          ClientToScreenY((rect.y1 + rect.y2) / 2)};
+    HMONITOR hMonitor = MonitorFromPoint(regionCenter, MONITOR_DEFAULTTONEAREST);
+
+    int monitorTop = 0;
+    int monitorHeight = VirtualScreenHeight();
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    if (hMonitor && GetMonitorInfoW(hMonitor, &mi)) {
+        // De vuelta a coordenadas de cliente del overlay.
+        monitorTop = mi.rcMonitor.top - VirtualScreenTop();
+        monitorHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    }
+
+    int centerY = monitorTop + monitorHeight / 2;
+    int offsetY = (int)((monitorHeight / 2) * 0.2); // 20% arriba del centro
     zoom_center_y.store(centerY - offsetY);
     
     // Copiar el texto actual antes de borrarlo (solo la primera vez que se hace zoom)
@@ -3585,6 +4896,15 @@ void CleanupZoomResources() {
 }
 
 // Función para actualizar frames de GIFs con velocidad original
+// Arranca el timer de animacion de GIFs si hace falta. Se llama al agregar un GIF.
+void EnsureGifTimer() {
+    HWND overlay = hCurrentOverlay.load();
+    if (overlay) {
+        // ~30 fps. El handler mata el timer solo cuando ya no hay GIFs.
+        SetTimer(overlay, TIMER_GIF_FRAMES, 33, NULL);
+    }
+}
+
 void UpdateGifFrames() {
     DWORD currentTime = GetTickCount();
     
@@ -3598,7 +4918,7 @@ void UpdateGifFrames() {
                     gif.last_frame_time = currentTime;
                     
                     // Forzar redibujado para mostrar el nuevo frame
-                    needsRedraw.store(true);
+                    RequestOverlayRedraw();
                     
                     // Debug: mostrar información del frame actual
                     #ifdef DEBUG_BUILD
@@ -3614,101 +4934,110 @@ void UpdateGifFrames() {
 }
 
 // Función para crear y mostrar el overlay
+// Función para crear y mostrar el overlay
 void ShowOverlay() {
     if (overlay_active.load()) return;
-    
+
     overlay_active.store(true);
     selection_mode.store(true);
-    needsRedraw.store(true);
-    screenRectangles.clear();
-    
+
+    {
+        std::lock_guard<std::mutex> lock(g_annotationMutex);
+        screenRectangles.clear();
+
+        // Tambien se limpian los dibujos. Antes solo se borraba screenRectangles,
+        // asi que al reabrir el overlay reaparecian las lineas y flechas de la
+        // sesion anterior flotando sobre una pantalla distinta y sin sus regiones.
+        drawing_elements.clear();
+        redo_stack.clear();
+        pen_stroke.clear();
+    }
+    step_counter.store(1);
+
     // Inicializar coordenadas de selección con -1 (sin selección)
     start_x.store(-1);
     start_y.store(-1);
     end_x.store(-1);
     end_y.store(-1);
-    
-    // Obtener dimensiones de la pantalla
-    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    
+
+    // Dimensiones del ESCRITORIO VIRTUAL, no del monitor primario: antes el
+    // overlay se creaba en (0, 0, SM_CXSCREEN, SM_CYSCREEN) y por eso nunca podia
+    // cubrir un segundo monitor.
+    int screenLeft = VirtualScreenLeft();
+    int screenTop = VirtualScreenTop();
+    int screenWidth = VirtualScreenWidth();
+    int screenHeight = VirtualScreenHeight();
+
     // Crear ventana overlay con procedimiento personalizado
-    // Usar WS_EX_TRANSPARENT para permitir que los eventos pasen a través de áreas transparentes
     HWND hOverlay = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOPMOST,
         L"ScreenHighlighterOverlayClass",
         L"Screen Highlighter Overlay",
         WS_POPUP,
-        0, 0, screenWidth, screenHeight,
+        screenLeft, screenTop, screenWidth, screenHeight,
         NULL, NULL, GetModuleHandle(NULL), NULL
     );
-    
-    if (!hOverlay) return;
-    
+
+    if (!hOverlay) {
+        overlay_active.store(false);
+        return;
+    }
+
     // Asignar handle global para poder cambiar atributos dinámicamente
-    hCurrentOverlay = hOverlay;
-    
+    hCurrentOverlay.store(hOverlay);
+
     // Hacer la ventana semitransparente inicialmente
     SetLayeredWindowAttributes(hOverlay, 0, 128, LWA_ALPHA);
-    
-    // Mostrar la ventana
-    ShowWindow(hOverlay, SW_SHOW);
-    
-    // Obtener DC
-    HDC hdc = GetDC(hOverlay);
-    
-    // Thread para hacer parpadear el cursor del texto
-    std::thread cursor_thread([]() {
-        while (overlay_active.load()) {
-            if (text_input_mode.load()) {
-                text_cursor_visible.store(!text_cursor_visible.load());
-                            // Solo redibujar si hay texto visible (no redibujar si está vacío)
-            if (!zoom_text.empty()) {
-                needsRedraw.store(true);
-            }
-        }
-        // Usar la velocidad del cursor configurada por el usuario
-            Sleep(text_cursor_blink_speed.load()); // Parpadear según configuración
-        }
-    });
-    cursor_thread.detach();
-    
 
-    
-    // Bucle principal del overlay
+    // Copia del escritorio limpio ANTES de mostrar el overlay, para que no quede
+    // capturado su propio tinte. Es la fuente de la herramienta de pixelado.
+    CaptureCleanDesktop(screenWidth, screenHeight);
+
+    // Mostrar la ventana (genera el primer WM_PAINT)
+    ShowWindow(hOverlay, SW_SHOW);
+
+    // Parpadeo del cursor de texto.
+    //
+    // Antes esto era un std::thread suelto que leia zoom_text.empty() mientras el
+    // hilo del overlay modificaba esa misma cadena: una carrera de datos real. Un
+    // timer de ventana entrega el evento en el hilo del overlay, sin carrera y sin
+    // un hilo extra.
+    SetTimer(hOverlay, TIMER_CURSOR_BLINK,
+             std::clamp(text_cursor_blink_speed.load(), 100, 2000), NULL);
+
+    // Bucle principal del overlay.
+    //
+    // GetMessage BLOQUEA hasta que llega un mensaje, por lo que con el overlay
+    // abierto y quieto el consumo de CPU es practicamente nulo. Antes este bucle
+    // hacia Sleep(16..50) indefinidamente.
+    //
+    // Las rutas que cierran el overlay (ESC, WM_DESTROY) ponen overlay_active en
+    // false desde OverlayWndProc, es decir dentro de DispatchMessage y en este
+    // mismo hilo, asi que la condicion se evalua justo despues y no hace falta
+    // despertar el bucle artificialmente.
+    MSG msg;
     while (overlay_active.load()) {
-        // Solo dibujar si es necesario
-        if (needsRedraw.load()) {
-            DrawOverlay(hdc, screenWidth, screenHeight);
-            needsRedraw.store(false);
+        if (!GetMessage(&msg, NULL, 0, 0)) {
+            break; // WM_QUIT
         }
-        
-        // Actualizar frames de GIFs
-        UpdateGifFrames();
-        
-        // Procesar mensajes
-        MSG msg;
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                overlay_active.store(false);
-                break;
-            }
-            
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        
-        // Pausa más larga si no hay cambios
-        Sleep(needsRedraw.load() ? 16 : 50);
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
     }
-    
+
     // Limpiar recursos
-    ReleaseDC(hOverlay, hdc);
+    KillTimer(hOverlay, TIMER_CURSOR_BLINK);
+    KillTimer(hOverlay, TIMER_GIF_FRAMES);
+
+    // Limpiar variable global antes de destruir la ventana, para que ningun
+    // RequestOverlayRedraw use un handle ya invalido.
+    hCurrentOverlay.store(nullptr);
+
     DestroyWindow(hOverlay);
-    
-    // Limpiar variable global
-    hCurrentOverlay = NULL;
-    
+
+    // Liberar el back buffer del overlay y la copia del escritorio
+    ReleaseOverlayBackBuffer();
+    ReleaseCleanDesktop();
+
     // Limpiar recursos de zoom al salir del overlay
     CleanupZoomResources();
 }
@@ -3740,10 +5069,27 @@ void ShowSettingsOverlay() {
     
     settings_overlay_active.store(true);
     
-    // Obtener dimensiones de la pantalla
+    // Dimensiones del monitor donde esta el puntero, para que la ventana de
+    // configuracion no aparezca siempre en el primario.
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    
+    int screenOriginX = 0;
+    int screenOriginY = 0;
+    {
+        POINT cursorPos;
+        if (GetCursorPos(&cursorPos)) {
+            HMONITOR hMonitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi;
+            mi.cbSize = sizeof(mi);
+            if (hMonitor && GetMonitorInfoW(hMonitor, &mi)) {
+                screenOriginX = mi.rcMonitor.left;
+                screenOriginY = mi.rcMonitor.top;
+                screenWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+                screenHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            }
+        }
+    }
+
     // Crear ventana de configuración con diseño black amoled y scroll
     HWND hSettingsWindow = CreateWindowExW(
         WS_EX_TOPMOST,
@@ -3767,9 +5113,10 @@ void ShowSettingsOverlay() {
     // Calcular altura disponible (pantalla completa menos taskbar)
     int availableHeight = screenHeight - taskbarHeight;
     
-    // Centrar la ventana horizontalmente, alinear al tope verticalmente
-    int windowX = (screenWidth - 700) / 2;
-    int windowY = 0; // Alinear al tope de la pantalla
+    // Centrar la ventana horizontalmente, alinear al tope verticalmente,
+    // relativo al monitor elegido.
+    int windowX = screenOriginX + (screenWidth - 700) / 2;
+    int windowY = screenOriginY; // Alinear al tope de ese monitor
     
     // Configurar la ventana con altura completa disponible
     SetWindowPos(hSettingsWindow, HWND_TOPMOST, windowX, windowY, 700, availableHeight, SWP_SHOWWINDOW);
@@ -3777,71 +5124,249 @@ void ShowSettingsOverlay() {
     // Configurar procedimiento de ventana para la configuración
     SetWindowLongPtr(hSettingsWindow, GWLP_WNDPROC, (LONG_PTR)SettingsWndProc);
     
-    // Bucle principal de configuración
+    // Bucle principal de configuración.
+    //
+    // Igual que en el overlay: antes esto hacia Sleep(16) indefinidamente, o sea
+    // 60 despertares por segundo mientras la ventana estaba abierta sin que el
+    // usuario tocara nada. GetMessage bloquea hasta que hay algo que procesar.
+    //
+    // Las rutas que cierran esta ventana ponen settings_overlay_active en false
+    // desde SettingsWndProc, dentro de DispatchMessage y en este mismo hilo, por
+    // lo que la condicion se reevalua inmediatamente despues.
+    MSG msg;
     while (settings_overlay_active.load()) {
-        // Procesar mensajes
-        MSG msg;
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT || msg.message == WM_CLOSE) {
-                settings_overlay_active.store(false);
-                break;
-            }
-            
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+        if (!GetMessage(&msg, NULL, 0, 0)) {
+            break; // WM_QUIT
         }
-        
-        Sleep(16); // 60 FPS
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
     }
-    
     // Limpiar recursos
     DestroyWindow(hSettingsWindow);
 }
 
 // Función para manejar eventos del mouse en el overlay
+// Atiende los atajos configurables: seleccion de herramienta y leyenda.
+// Devuelve true si la tecla se consumio.
+//
+// Va en una funcion aparte para que el case WM_KEYDOWN pueda seguir siendo una
+// cadena de if/else sin declaraciones locales.
+bool HandleConfigurableHotkey(WPARAM wParam) {
+    // Ctrl esta reservado para Ctrl+Z / Ctrl+Y / Ctrl+T: si esta pulsado, la
+    // tecla no es un atajo de herramienta aunque coincida la letra.
+    if (GetKeyState(VK_CONTROL) & 0x8000) return false;
+
+    const int pressed = static_cast<int>(wParam);
+    const bool typing = text_input_mode.load();
+
+    for (const ToolHotkey& hk : kToolHotkeys) {
+        const int toolKey = hk.key->load();
+        if (pressed != toolKey) continue;
+        // Dentro del modo texto una letra suelta es texto que el usuario quiere
+        // escribir, no un atajo. Las teclas de funcion si se aceptan.
+        if (typing && !ToolHotkeyAllowedWhileTyping(toolKey)) return false;
+        current_drawing_tool.store(hk.tool);
+        drawing_active.store(true);
+        text_input_mode.store(false);
+        RequestOverlayRedraw();
+        return true;
+    }
+
+    const int legendKey = hotkey_toggle_legend.load();
+    if (pressed == legendKey &&
+        (!typing || ToolHotkeyAllowedWhileTyping(legendKey))) {
+        // Se guarda para que quien oculte la leyenda no se la vuelva a encontrar
+        // en el siguiente uso.
+        show_shortcut_legend.store(!show_shortcut_legend.load());
+        SaveConfiguration();
+        RequestOverlayRedraw();
+        return true;
+    }
+
+    return false;
+}
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
+        // Todo el dibujado pasa por aqui. Antes el overlay no tenia handler de
+        // WM_PAINT: un bucle aparte llamaba a DrawOverlay sobre un HDC obtenido
+        // con GetDC y mantenido abierto durante toda la vida de la ventana.
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            // ps.rcPaint acota el trabajo al area realmente invalidada. Si viene
+            // vacio (puede pasar tras un EndPaint sin region) se pinta todo.
+            RECT paintRect = ps.rcPaint;
+            if (IsRectEmpty(&paintRect)) paintRect = rc;
+            DrawOverlay(hdc, rc.right - rc.left, rc.bottom - rc.top, paintRect);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        // El fondo lo pinta DrawOverlay por completo en su back buffer; dejar que
+        // Windows lo borre antes solo produciria parpadeo.
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_TIMER:
+            if (wParam == TIMER_CURSOR_BLINK) {
+                // El hilo anterior releia la velocidad en cada vuelta. Un timer de
+                // periodo fijo ignoraria un cambio hecho en configuracion hasta
+                // reabrir el overlay, asi que se reajusta cuando cambia.
+                static int lastBlinkSpeed = -1;
+                const int desiredSpeed = std::clamp(text_cursor_blink_speed.load(),
+                                                    100, 2000);
+                if (desiredSpeed != lastBlinkSpeed) {
+                    lastBlinkSpeed = desiredSpeed;
+                    SetTimer(hwnd, TIMER_CURSOR_BLINK, desiredSpeed, NULL);
+                }
+
+                if (text_input_mode.load()) {
+                    text_cursor_visible.store(!text_cursor_visible.load());
+                    bool hasText;
+                    {
+                        std::lock_guard<std::mutex> lock(g_annotationMutex);
+                        hasText = !zoom_text.empty();
+                    }
+                    if (hasText) {
+                        RequestOverlayRedraw();
+                    }
+                }
+            } else if (wParam == TIMER_GIF_FRAMES) {
+                bool anyGifs;
+                {
+                    std::lock_guard<std::mutex> lock(g_annotationMutex);
+                    anyGifs = !gif_elements.empty();
+                }
+                if (anyGifs) {
+                    UpdateGifFrames();
+                } else {
+                    // Sin GIFs no hace falta seguir despertando.
+                    KillTimer(hwnd, TIMER_GIF_FRAMES);
+                }
+            }
+            return 0;
+
+        // Reconstruir el overlay si cambia la resolucion o la disposicion de
+        // monitores mientras esta abierto.
+        case WM_DISPLAYCHANGE: {
+            ReleaseOverlayBackBuffer();
+            // Reajustar el overlay al nuevo escritorio virtual y volver a
+            // capturarlo, si no el pixelado usaria una copia obsoleta.
+            const int vw = VirtualScreenWidth();
+            const int vh = VirtualScreenHeight();
+            SetWindowPos(hwnd, HWND_TOPMOST, VirtualScreenLeft(), VirtualScreenTop(),
+                         vw, vh, SWP_NOACTIVATE);
+            CaptureCleanDesktop(vw, vh);
+            RequestOverlayRedraw();
+            return 0;
+        }
+
         case WM_LBUTTONDOWN:
+            // Empieza un arrastre nuevo: la vista previa del anterior ya no sirve
+            // como referencia para la union de rectangulos sucios.
+            ResetPreviewRectTracking();
             if (screenshot_mode.load()) {
                 // Modo captura de pantalla
-                screenshot_start_x.store(LOWORD(lParam));
-                screenshot_start_y.store(HIWORD(lParam));
-                screenshot_end_x.store(LOWORD(lParam));
-                screenshot_end_y.store(HIWORD(lParam));
-                needsRedraw.store(true);
+                screenshot_start_x.store(GET_X_LPARAM(lParam));
+                screenshot_start_y.store(GET_Y_LPARAM(lParam));
+                screenshot_end_x.store(GET_X_LPARAM(lParam));
+                screenshot_end_y.store(GET_Y_LPARAM(lParam));
+                RequestOverlayRedraw();
             } else if (drawing_active.load()) {
+                const int mx = GET_X_LPARAM(lParam);
+                const int my = GET_Y_LPARAM(lParam);
+                const DrawingTool tool = current_drawing_tool.load();
+
+                // El selector se dibuja encima, asi que tiene prioridad sobre el
+                // inicio de un trazo.
+                if (Toolbar::HitTest(mx, my)) {
+                    RequestOverlayRedraw();
+                    break;
+                }
+
+                if (tool == DrawingTool::Step) {
+                    // El marcador de paso se coloca con un solo clic, sin arrastrar.
+                    std::lock_guard<std::mutex> lock(g_annotationMutex);
+                    DrawingElement marker(DrawingTool::Step, mx, my, mx, my,
+                                          drawing_color.load(),
+                                          drawing_thickness.load(), true);
+                    marker.step_number = step_counter.fetch_add(1);
+                    drawing_elements.push_back(std::move(marker));
+                    redo_stack.clear();
+                    RequestOverlayRedraw();
+                    break;
+                }
+
+                if (tool == DrawingTool::Pen) {
+                    // Comenzar un trazo libre.
+                    std::lock_guard<std::mutex> lock(g_annotationMutex);
+                    pen_stroke.clear();
+                    pen_stroke.push_back(POINT{mx, my});
+                }
+
                 // Modo dibujo activo - las regiones no son interactivas
-                drawing_start_x.store(LOWORD(lParam));
-                drawing_start_y.store(HIWORD(lParam));
-                end_x.store(LOWORD(lParam));
-                end_y.store(HIWORD(lParam));
-                needsRedraw.store(true);
+                drawing_start_x.store(mx);
+                drawing_start_y.store(my);
+                end_x.store(mx);
+                end_y.store(my);
+                RequestOverlayRedraw();
             } else if (selection_mode.load() && !drawing_active.load()) {
                 // Solo permitir selección si no hay herramienta de dibujo activa
-                start_x.store(LOWORD(lParam));
-                start_y.store(HIWORD(lParam));
+                start_x.store(GET_X_LPARAM(lParam));
+                start_y.store(GET_Y_LPARAM(lParam));
                 end_x.store(start_x.load());
                 end_y.store(start_y.load());
-                needsRedraw.store(true);
+                RequestOverlayRedraw();
             }
             break;
             
         case WM_MOUSEMOVE:
             if (screenshot_mode.load() && screenshot_start_x.load() != -1) {
                 // Modo captura - mostrar preview
-                screenshot_end_x.store(LOWORD(lParam));
-                screenshot_end_y.store(HIWORD(lParam));
-                needsRedraw.store(true);
+                screenshot_end_x.store(GET_X_LPARAM(lParam));
+                screenshot_end_y.store(GET_Y_LPARAM(lParam));
+                // El recuadro de captura lleva un rotulo debajo, de ahi el margen
+                // extra respecto al resto de vistas previas.
+                RequestPreviewRedraw(screenshot_start_x.load(), screenshot_start_y.load(),
+                                     screenshot_end_x.load(), screenshot_end_y.load(), 48);
             } else if (drawing_active.load() && drawing_start_x.load() != -1) {
+                const int mx = GET_X_LPARAM(lParam);
+                const int my = GET_Y_LPARAM(lParam);
+
+                if (current_drawing_tool.load() == DrawingTool::Pen) {
+                    std::lock_guard<std::mutex> lock(g_annotationMutex);
+                    // Descartar puntos casi repetidos: reduce el tamaño del trazo
+                    // sin que se note en pantalla.
+                    if (pen_stroke.empty() ||
+                        std::abs(pen_stroke.back().x - mx) > 1 ||
+                        std::abs(pen_stroke.back().y - my) > 1) {
+                        pen_stroke.push_back(POINT{mx, my});
+                    }
+                }
+
                 // Modo dibujo - mostrar preview
-                end_x.store(LOWORD(lParam));
-                end_y.store(HIWORD(lParam));
-                needsRedraw.store(true);
+                end_x.store(mx);
+                end_y.store(my);
+                // El lapiz acumula trazo: el resto ya esta en el back buffer, solo
+                // hace falta repintar alrededor del punto nuevo. Las demas
+                // herramientas son bandas elasticas ancladas al punto inicial.
+                if (current_drawing_tool.load() == DrawingTool::Pen) {
+                    RequestPreviewRedraw(mx, my, mx, my,
+                                         drawing_thickness.load() * 2 + 16);
+                } else {
+                    RequestPreviewRedraw(drawing_start_x.load(), drawing_start_y.load(),
+                                         mx, my, drawing_thickness.load() * 4 + 16);
+                }
             } else if (selection_mode.load() && start_x.load() != -1 && !drawing_active.load()) {
                 // Solo permitir selección si no hay herramienta de dibujo activa
-                end_x.store(LOWORD(lParam));
-                end_y.store(HIWORD(lParam));
-                needsRedraw.store(true);
+                end_x.store(GET_X_LPARAM(lParam));
+                end_y.store(GET_Y_LPARAM(lParam));
+                RequestPreviewRedraw(start_x.load(), start_y.load(),
+                                     end_x.load(), end_y.load(),
+                                     region_border_thickness.load() * 2 + 16);
             }
             break;
             
@@ -3860,19 +5385,34 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // Aplicar cambio de zoom con límites y centrado inmediato
                 float newZoom = zoom_factor.load() * zoomChange;
                 if (newZoom >= 0.5f && newZoom <= 5.0f) {
-                    // Calcular el centro de la pantalla
-                    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-                    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-                    int screenCenterX = screenWidth / 2;
-                    int screenCenterY = screenHeight / 2;
-                    
+                    // Centrar en el monitor donde esta el puntero, no en el
+                    // primario: antes se usaba SM_CXSCREEN/SM_CYSCREEN, asi que al
+                    // ampliar en un monitor secundario el zoom saltaba al primario.
+                    // OJO: a diferencia de WM_LBUTTONDOWN y WM_MOUSEMOVE,
+                    // WM_MOUSEWHEEL entrega lParam ya en coordenadas de PANTALLA,
+                    // por lo que no hay que convertirlo.
+                    POINT screenPos = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+
+                    int centerX = VirtualScreenWidth() / 2;
+                    int centerY = VirtualScreenHeight() / 2;
+
+                    HMONITOR hMonitor = MonitorFromPoint(screenPos, MONITOR_DEFAULTTONEAREST);
+                    MONITORINFO mi;
+                    mi.cbSize = sizeof(mi);
+                    if (hMonitor && GetMonitorInfoW(hMonitor, &mi)) {
+                        centerX = (mi.rcMonitor.left + mi.rcMonitor.right) / 2 - VirtualScreenLeft();
+                        centerY = (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2 - VirtualScreenTop();
+                    }
+
                     // Centrado inmediato: X en el centro, Y 20% arriba del centro
                     zoom_factor.store(newZoom);
-                    zoom_center_x.store(screenCenterX);
-                    int offsetY = (int)(screenCenterY * 0.2); // 20% arriba del centro
-                    zoom_center_y.store(screenCenterY - offsetY);
-                    
-                    needsRedraw.store(true);
+                    zoom_center_x.store(centerX);
+                    const int monitorHalfHeight = (hMonitor && GetMonitorInfoW(hMonitor, &mi))
+                        ? (mi.rcMonitor.bottom - mi.rcMonitor.top) / 2
+                        : VirtualScreenHeight() / 2;
+                    zoom_center_y.store(centerY - (int)(monitorHalfHeight * 0.2));
+
+                    RequestOverlayRedraw();
                 }
             }
             break;
@@ -3897,7 +5437,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 screenshot_start_y.store(-1);
                 screenshot_end_x.store(-1);
                 screenshot_end_y.store(-1);
-                needsRedraw.store(true);
+                RequestOverlayRedraw();
             } else if (drawing_active.load() && drawing_start_x.load() != -1) {
                 // Finalizar dibujo
                 int x1, y1, x2, y2;
@@ -3917,8 +5457,29 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 }
                 
                 // Verificar tamaño mínimo
+                // El lapiz se confirma con su lista de puntos, no con un
+                // rectangulo delimitador.
+                if (current_drawing_tool.load() == DrawingTool::Pen) {
+                    std::lock_guard<std::mutex> lock(g_annotationMutex);
+                    if (pen_stroke.size() >= 2) {
+                        DrawingElement stroke(DrawingTool::Pen,
+                                              pen_stroke.front().x, pen_stroke.front().y,
+                                              pen_stroke.back().x, pen_stroke.back().y,
+                                              drawing_color.load(),
+                                              drawing_thickness.load(), false);
+                        stroke.points = pen_stroke;
+                        drawing_elements.push_back(std::move(stroke));
+                        redo_stack.clear();
+                    }
+                    pen_stroke.clear();
+                    drawing_start_x.store(-1);
+                    drawing_start_y.store(-1);
+                    RequestOverlayRedraw();
+                    break;
+                }
+
                 bool isValidSize = false;
-                
+
                 if (current_drawing_tool.load() == DrawingTool::Line || current_drawing_tool.load() == DrawingTool::Arrow) { // Línea o Flecha
                     // Para línea y flecha, verificar distancia mínima entre puntos
                     int distance = (int)sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
@@ -3937,6 +5498,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                         drawing_thickness.load(),
                         drawing_fill.load()
                     );
+
+                    // Un elemento nuevo descarta el historial de rehacer.
+                    redo_stack.clear();
                 }
                 
                 // Mantener herramienta activa para dibujar más elementos
@@ -3945,7 +5509,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 // NO resetear drawing_active ni current_drawing_tool
                 // drawing_active.store(false);        // COMENTADO
                 // current_drawing_tool.store(0);     // COMENTADO
-                needsRedraw.store(true);
+                RequestOverlayRedraw();
             } else if (selection_mode.load() && start_x.load() != -1) {
                 // Calcular coordenadas de la región
                 int x1 = std::min(start_x.load(), end_x.load());
@@ -4019,36 +5583,56 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                 start_y.store(-1);
                 end_x.store(-1);
                 end_y.store(-1);
-                needsRedraw.store(true);
+                RequestOverlayRedraw();
             }
             break;
             
+        // Entrada de texto real. TranslateMessage (llamado en el bucle del
+        // overlay) convierte las pulsaciones en WM_CHAR ya resueltas segun la
+        // distribucion del teclado, por lo que este handler soporta acentos,
+        // teclas muertas, AltGr e IME sin tablas propias.
+        case WM_CHAR: {
+            if (!text_input_mode.load()) break;
+
+            const wchar_t ch = static_cast<wchar_t>(wParam);
+
+            // Descartar caracteres de control: Ctrl+letra llega como 1..26, y
+            // Enter, Tab, Escape y Retroceso ya se manejan en WM_KEYDOWN.
+            if (ch < 32 || ch == 127) break;
+
+            {
+                std::lock_guard<std::mutex> lock(g_annotationMutex);
+
+                // Si hay seleccion activa, escribir la reemplaza.
+                if (text_selection_active.load()) {
+                    int selStart = std::min(text_selection_start.load(),
+                                            text_selection_end.load());
+                    int selEnd = std::max(text_selection_start.load(),
+                                          text_selection_end.load());
+                    selStart = std::clamp(selStart, 0, static_cast<int>(zoom_text.length()));
+                    selEnd = std::clamp(selEnd, 0, static_cast<int>(zoom_text.length()));
+                    if (selStart < selEnd) {
+                        zoom_text.erase(selStart, selEnd - selStart);
+                        text_cursor_pos.store(selStart);
+                    }
+                    text_selection_active.store(false);
+                    text_selection_start.store(-1);
+                    text_selection_end.store(-1);
+                }
+
+                const int pos = std::clamp(text_cursor_pos.load(), 0,
+                                           static_cast<int>(zoom_text.length()));
+                zoom_text.insert(pos, 1, ch);
+                text_cursor_pos.store(pos + 1);
+            }
+
+            RequestOverlayRedraw();
+            break;
+        }
+
         case WM_KEYDOWN:
-            // Manejar teclas F1-F5 para herramientas de dibujo (siempre disponibles)
-            if (wParam == VK_F1) {
-                // F1 - Activar herramienta Línea
-                current_drawing_tool.store(DrawingTool::Line);
-                drawing_active.store(true);
-                needsRedraw.store(true);
-                return 0;
-            } else if (wParam == VK_F2) {
-                // F2 - Activar herramienta Flecha
-                current_drawing_tool.store(DrawingTool::Arrow);
-                drawing_active.store(true);
-                needsRedraw.store(true);
-                return 0;
-            } else if (wParam == VK_F3) {
-                // F3 - Activar herramienta Rectángulo
-                current_drawing_tool.store(DrawingTool::Rectangle);
-                drawing_active.store(true);
-                needsRedraw.store(true);
-                return 0;
-            // F4 (Texto) eliminado
-            } else if (wParam == VK_F4) {
-                // F4 - Activar herramienta Resaltador
-                current_drawing_tool.store(DrawingTool::Highlighter);
-                drawing_active.store(true);
-                needsRedraw.store(true);
+            // Atajos configurables de herramienta y de la leyenda (kToolHotkeys).
+            if (HandleConfigurableHotkey(wParam)) {
                 return 0;
             } else if (wParam == VK_ESCAPE) {
                 if (screenshot_mode.load()) {
@@ -4058,86 +5642,73 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                     screenshot_start_y.store(-1);
                     screenshot_end_x.store(-1);
                     screenshot_end_y.store(-1);
-                    needsRedraw.store(true);
+                    RequestOverlayRedraw();
                 } else if (drawing_active.load()) {
                     // Salir del modo dibujo
                     drawing_active.store(false);
                     current_drawing_tool.store(DrawingTool::None);
                     drawing_start_x.store(-1);
                     drawing_start_y.store(-1);
-                    needsRedraw.store(true);
+                    RequestOverlayRedraw();
                 } else if (zoom_active.load()) {
                     if (text_input_mode.load()) {
                         // Primer Escape: salir del modo texto
                         text_input_mode.store(false);
-                        needsRedraw.store(true);
+                        RequestOverlayRedraw();
                     } else {
                         // Segundo Escape: salir del zoom
                         CleanupZoomResources();
-                        needsRedraw.store(true);
+                        RequestOverlayRedraw();
                     }
                 } else {
                     // Tercer Escape: salir del overlay completamente
                     overlay_active.store(false);
                 }
+            } else if (wParam == 'Y' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                // Ctrl+Y para rehacer
+                if (!redo_stack.empty()) {
+                    drawing_elements.push_back(std::move(redo_stack.back()));
+                    redo_stack.pop_back();
+                    RequestOverlayRedraw();
+                }
+            } else if (wParam == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000) &&
+                       (GetKeyState(VK_SHIFT) & 0x8000)) {
+                // Ctrl+Shift+Z: rehacer (alternativa habitual a Ctrl+Y)
+                if (!redo_stack.empty()) {
+                    drawing_elements.push_back(std::move(redo_stack.back()));
+                    redo_stack.pop_back();
+                    RequestOverlayRedraw();
+                }
             } else if (wParam == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 // Ctrl+Z para deshacer
                 if (!drawing_elements.empty()) {
-                    // Deshacer último elemento de dibujo
+                    // El elemento deshecho pasa a la pila de rehacer.
+                    redo_stack.push_back(std::move(drawing_elements.back()));
                     drawing_elements.pop_back();
-                    needsRedraw.store(true);
+                    RequestOverlayRedraw();
                 } else if (!screenRectangles.empty()) {
                     screenRectangles.pop_back();
                     // Si era la última región con zoom, limpiar recursos
                     if (screenRectangles.empty() || zoom_active.load()) {
                         CleanupZoomResources();
                     }
-                    needsRedraw.store(true);
+                    RequestOverlayRedraw();
                 }
             // Ctrl+Enter para captura de pantalla (ahora deshabilitado - usar Shift+Alt+X cuando overlay está activo)
             } else if (wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 // Deshabilitado: ahora usar Shift+Alt+X cuando el overlay está activo
                 // Mantener para compatibilidad pero no hacer nada
-                printf("ℹ️ Ctrl+Enter disabled - use Shift+Alt+X when overlay is active\n");
+                LogDebug("ℹ️ Ctrl+Enter disabled - use Shift+Alt+X when overlay is active\n");
                 return 0;
-            } else if (wParam == 'T' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-                // Ctrl+T para activar modo texto (con o sin zoom)
+            } else if (wParam == static_cast<WPARAM>(hotkey_tool_text.load()) &&
+                       (GetKeyState(VK_CONTROL) & 0x8000)) {
+                // Ctrl + tecla de texto: activa el modo texto (con o sin zoom)
                 text_input_mode.store(true);
-                needsRedraw.store(true);
+                RequestOverlayRedraw();
             } else if (text_input_mode.load()) {
-                // Manejo de texto cuando está en modo edición
-                // Las teclas F1-F5 también funcionan en modo texto para herramientas de dibujo
-                if (wParam == VK_F1) {
-                    // F1 - Activar herramienta Línea
-                    current_drawing_tool.store(DrawingTool::Line);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    needsRedraw.store(true);
-                    return 0;
-                } else if (wParam == VK_F2) {
-                    // F2 - Activar herramienta Flecha
-                    current_drawing_tool.store(DrawingTool::Arrow);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    needsRedraw.store(true);
-                    return 0;
-                } else if (wParam == VK_F3) {
-                    // F3 - Activar herramienta Rectángulo
-                    current_drawing_tool.store(DrawingTool::Rectangle);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    needsRedraw.store(true);
-                    return 0;
-                // F4 (Texto) eliminado
-                } else if (wParam == VK_F4) {
-                    // F4 - Activar herramienta Resaltador
-                    current_drawing_tool.store(DrawingTool::Highlighter);
-                    drawing_active.store(true);
-                    text_input_mode.store(false);
-                    needsRedraw.store(true);
-                    return 0;
-                }
-                
+                // Manejo de texto cuando está en modo edición.
+                // Los atajos de herramienta ya los resolvio
+                // HandleConfigurableHotkey antes de llegar aqui.
                 switch (wParam) {
                     case VK_RETURN:
                         // Enter para salto de línea
@@ -4145,7 +5716,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                         text_cursor_pos.store(text_cursor_pos.load() + 1);
                         
                         // Forzar actualización inmediata del cursor
-                        needsRedraw.store(true);
+                        RequestOverlayRedraw();
                         
                         // Forzar actualización del cursor parpadeante
                         text_cursor_visible.store(true);
@@ -4170,7 +5741,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                 if (startPos < pos) {
                                     zoom_text.erase(startPos, pos - startPos);
                                     text_cursor_pos.store(startPos);
-                                    needsRedraw.store(true);
+                                    RequestOverlayRedraw();
                                 }
                             }
                         } else {
@@ -4178,7 +5749,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             if (!zoom_text.empty() && text_cursor_pos.load() > 0) {
                                 zoom_text.erase(text_cursor_pos.load() - 1, 1);
                                 text_cursor_pos.store(text_cursor_pos.load() - 1);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         }
                         break;
@@ -4207,7 +5778,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             }
                             text_cursor_pos.store(text_cursor_pos.load() - 1);
                             // Debug deshabilitado para producción
-                            needsRedraw.store(true);
+                            RequestOverlayRedraw();
                         }
                         break;
                         
@@ -4235,7 +5806,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             }
                             text_cursor_pos.store(text_cursor_pos.load() + 1);
                             // Debug deshabilitado para producción
-                            needsRedraw.store(true);
+                            RequestOverlayRedraw();
                         }
                         break;
                         
@@ -4267,7 +5838,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             }
                             text_selection_end.store(pos);
                             text_cursor_pos.store(pos);
-                            needsRedraw.store(true);
+                            RequestOverlayRedraw();
                         } else {
                             // Solo Home: ir al inicio de la línea actual
                             int pos = text_cursor_pos.load();
@@ -4279,7 +5850,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             text_selection_start.store(-1);
                             text_selection_end.store(-1);
                         }
-                        needsRedraw.store(true);
+                        RequestOverlayRedraw();
                         break;
                         
                     case VK_END:
@@ -4310,7 +5881,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             }
                             text_selection_end.store(pos);
                             text_cursor_pos.store(pos);
-                            needsRedraw.store(true);
+                            RequestOverlayRedraw();
                         } else {
                             // Solo End: ir al final de la línea actual
                             int pos = text_cursor_pos.load();
@@ -4322,7 +5893,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             text_selection_start.store(-1);
                             text_selection_end.store(-1);
                         }
-                        needsRedraw.store(true);
+                        RequestOverlayRedraw();
                         break;
                         
                     case VK_UP:
@@ -4345,7 +5916,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                 text_selection_active.store(false);
                                 text_selection_start.store(-1);
                                 text_selection_end.store(-1);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         } else if (GetKeyState(VK_SHIFT) & 0x8000) {
                             // Shift+Up: seleccionar hacia arriba
@@ -4368,7 +5939,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                     (currentLineStart - prevLineStart - 1));
                                 text_cursor_pos.store(targetPos);
                                 text_selection_end.store(targetPos);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         } else {
                             // Solo Up: ir a la línea anterior
@@ -4388,7 +5959,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                 text_selection_active.store(false);
                                 text_selection_start.store(-1);
                                 text_selection_end.store(-1);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         }
                         break;
@@ -4418,7 +5989,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                 text_selection_active.store(false);
                                 text_selection_start.store(-1);
                                 text_selection_end.store(-1);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         } else if (GetKeyState(VK_SHIFT) & 0x8000) {
                             // Shift+Down: seleccionar hacia abajo
@@ -4446,7 +6017,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                     (nextLineEnd - nextLineStart));
                                 text_cursor_pos.store(targetPos);
                                 text_selection_end.store(targetPos);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         } else {
                             // Solo Down: ir a la línea siguiente
@@ -4469,7 +6040,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                     (nextLineEnd - nextLineStart));
                                 text_cursor_pos.store(targetPos);
                                 text_selection_end.store(targetPos);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         }
                         break;
@@ -4492,14 +6063,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                 
                                 if (endPos > pos) {
                                     zoom_text.erase(pos, endPos - pos);
-                                    needsRedraw.store(true);
+                                    RequestOverlayRedraw();
                                 }
                             }
                         } else {
                             // Delete normal: borrar un carácter
                             if (!zoom_text.empty() && text_cursor_pos.load() < static_cast<int>(zoom_text.length())) {
                                 zoom_text.erase(text_cursor_pos.load(), 1);
-                                needsRedraw.store(true);
+                                RequestOverlayRedraw();
                             }
                         }
                         break;
@@ -4537,17 +6108,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                 }
                                 CloseClipboard();
                             }
-                        } else {
-                            // C normal - aplicar conversión a minúsculas
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            wchar_t character = 'c'; // Por defecto minúscula
-                            if (shiftPressed) {
-                                character = 'C'; // Mayúscula si Shift está presionado
-                            }
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
                         }
+                        // Sin Ctrl esta tecla es texto normal: la inserta WM_CHAR, que
+                        // respeta la distribucion del teclado, Shift, Bloq Mayus, AltGr,
+                        // teclas muertas e IME.
                         break;
                         
                     case 'X':
@@ -4576,21 +6140,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                         zoom_text.erase(start, end - start);
                                         text_cursor_pos.store(start);
                                         text_selection_active.store(false);
-                                        needsRedraw.store(true);
+                                        RequestOverlayRedraw();
                                     }
                                 }
                             }
-                        } else {
-                            // X normal - aplicar conversión a minúsculas
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            wchar_t character = 'x'; // Por defecto minúscula
-                            if (shiftPressed) {
-                                character = 'X'; // Mayúscula si Shift está presionado
-                            }
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
                         }
+                        // Sin Ctrl esta tecla es texto normal: la inserta WM_CHAR, que
+                        // respeta la distribucion del teclado, Shift, Bloq Mayus, AltGr,
+                        // teclas muertas e IME.
                         break;
                         
                     case 'V':
@@ -4600,22 +6157,22 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             if (CheckClipboardForGif()) {
                                 // Hay un GIF - intentar cargarlo
                                 if (AddGifElement()) {
-                                    needsRedraw.store(true);
+                                    RequestOverlayRedraw();
                                 } else {
                                     // Si falla, insertar marcador de error
                                     zoom_text.insert(text_cursor_pos.load(), L"[ERROR GIF]");
                                     text_cursor_pos.store(text_cursor_pos.load() + 10);
-                                    needsRedraw.store(true);
+                                    RequestOverlayRedraw();
                                 }
                             } else if (CheckClipboardForImage()) {
                                 // Hay una imagen - intentar capturarla
                                 if (AddImageElement()) {
-                                    needsRedraw.store(true);
+                                    RequestOverlayRedraw();
                                 } else {
                                     // Si falla, insertar marcador de error
                                     zoom_text.insert(text_cursor_pos.load(), L"[ERROR IMAGEN]");
                                     text_cursor_pos.store(text_cursor_pos.load() + 15);
-                                    needsRedraw.store(true);
+                                    RequestOverlayRedraw();
                                 }
                             } else {
                                 // No hay imagen ni GIF, intentar pegar texto
@@ -4627,24 +6184,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                                             std::wstring clipboardText(pszText);
                                             zoom_text.insert(text_cursor_pos.load(), clipboardText);
                                             text_cursor_pos.store(text_cursor_pos.load() + clipboardText.length());
-                                            needsRedraw.store(true);
+                                            RequestOverlayRedraw();
                                             GlobalUnlock(hData);
                                         }
                                     }
                                     CloseClipboard();
                                 }
                             }
-                        } else {
-                            // V normal - aplicar conversión a minúsculas
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            wchar_t character = 'v'; // Por defecto minúscula
-                            if (shiftPressed) {
-                                character = 'V'; // Mayúscula si Shift está presionado
-                            }
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
                         }
+                        // Sin Ctrl esta tecla es texto normal: la inserta WM_CHAR, que
+                        // respeta la distribucion del teclado, Shift, Bloq Mayus, AltGr,
+                        // teclas muertas e IME.
                         break;
                         
                     case 'A':
@@ -4654,18 +6204,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             text_selection_end.store(zoom_text.length());
                             text_selection_active.store(true);
                             text_cursor_pos.store(zoom_text.length());
-                            needsRedraw.store(true);
-                        } else {
-                            // A normal - aplicar conversión a minúsculas
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            wchar_t character = 'a'; // Por defecto minúscula
-                            if (shiftPressed) {
-                                character = 'A'; // Mayúscula si Shift está presionado
-                            }
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
+                            RequestOverlayRedraw();
                         }
+                        // Sin Ctrl esta tecla es texto normal: la inserta WM_CHAR, que
+                        // respeta la distribucion del teclado, Shift, Bloq Mayus, AltGr,
+                        // teclas muertas e IME.
                         break;
                         
                     case 'Z':
@@ -4675,108 +6218,30 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
                             text_selection_active.store(false);
                             text_selection_start.store(-1);
                             text_selection_end.store(-1);
-                            needsRedraw.store(true);
-                        } else {
-                            // Z normal - aplicar conversión a minúsculas
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            wchar_t character = 'z'; // Por defecto minúscula
-                            if (shiftPressed) {
-                                character = 'Z'; // Mayúscula si Shift está presionado
-                            }
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
+                            RequestOverlayRedraw();
                         }
+                        // Sin Ctrl esta tecla es texto normal: la inserta WM_CHAR, que
+                        // respeta la distribucion del teclado, Shift, Bloq Mayus, AltGr,
+                        // teclas muertas e IME.
                         break;
                         
 
                         
                     default:
-                        // Caracteres imprimibles básicos (ASCII) y especiales
-                        if (wParam >= 32) {
-                            
-                            // Detectar si Shift está presionado
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            
-                            // Obtener el carácter real del teclado
-                            wchar_t character = (wchar_t)wParam;
-                            
-                            // Mapeo de caracteres especiales comunes
-                            switch (wParam) {
-                                case 186: // ; : (tecla punto y coma)
-                                    character = shiftPressed ? L':' : L';';
-                                    break;
-                                case 188: // , < (tecla coma)
-                                    character = shiftPressed ? L'<' : L',';
-                                    break;
-                                case 190: // . > (tecla punto)
-                                    character = shiftPressed ? L'>' : L'.';
-                                    break;
-                                case 191: // / ? (tecla barra)
-                                    character = shiftPressed ? L'?' : L'/';
-                                    break;
-                                case 192: // ` ~ (tecla acento grave)
-                                    character = shiftPressed ? L'~' : L'`';
-                                    break;
-                                case 219: // [ { (tecla corchete)
-                                    character = shiftPressed ? L'{' : L'[';
-                                    break;
-                                case 220: // \ | (tecla barra invertida)
-                                    character = shiftPressed ? L'|' : L'\\';
-                                    break;
-                                case 221: // ] } (tecla corchete)
-                                    character = shiftPressed ? L'}' : L']';
-                                    break;
-                                case 222: // ' " (tecla apóstrofe)
-                                    character = shiftPressed ? L'"' : L'\'';
-                                    break;
-                                case 189: // - _ (tecla guión)
-                                    character = shiftPressed ? L'_' : L'-';
-                                    break;
-                                case 187: // = + (tecla igual)
-                                    character = shiftPressed ? L'+' : L'=';
-                                    break;
-                                default:
-                                    // Para otros caracteres, usar el valor directo
-                                    if (!shiftPressed && character >= L'A' && character <= L'Z') {
-                                        character = character + 32; // Convertir a minúscula
-                                    }
-                                    break;
-                            }
-                            
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
-                        }
-                        // Caracteres internacionales y UTF-8
-                        else if (wParam >= 128) {
-                            // Insertar caracteres Unicode/UTF-8 directamente
-                            wchar_t character = (wchar_t)wParam;
-                            
-                            // Aplicar conversión a minúsculas
-                            bool shiftPressed = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                            if (!shiftPressed) {
-                                // Convertir caracteres Unicode/UTF-8 a minúsculas cuando sea posible
-                                if (character >= L'A' && character <= L'Z') {
-                                    character = character + 32; // Convertir a minúscula
-                                } else {
-                                    // Convertir caracteres españoles comunes a minúsculas
-                                    switch (character) {
-                                        case L'Á': character = L'á'; break;
-                                        case L'É': character = L'é'; break;
-                                        case L'Í': character = L'í'; break;
-                                        case L'Ó': character = L'ó'; break;
-                                        case L'Ú': character = L'ú'; break;
-                                        case L'Ñ': character = L'ñ'; break;
-                                        case L'Ü': character = L'ü'; break;
-                                    }
-                                }
-                            }
-                            
-                            zoom_text.insert(text_cursor_pos.load(), 1, character);
-                            text_cursor_pos.store(text_cursor_pos.load() + 1);
-                            needsRedraw.store(true);
-                        }
+                        // Las teclas imprimibles se insertan en WM_CHAR.
+                        //
+                        // Aqui habia una tabla VK->caracter escrita a mano que
+                        // asumia teclado US QWERTY (VK 186 == ';'), por lo que en
+                        // una distribucion espanola o latinoamericana la puntuacion
+                        // salia equivocada. Su rama de "caracteres internacionales"
+                        // era codigo muerto: estaba en
+                        //   if (wParam >= 32) {...} else if (wParam >= 128) {...}
+                        // y como 128 >= 32 nunca se alcanzaba, por lo que las
+                        // vocales acentuadas jamas llegaban a insertarse.
+                        //
+                        // WM_CHAR ya recibe el caracter correcto de Windows, con
+                        // distribucion, Shift, Bloq Mayus, AltGr, teclas muertas e
+                        // IME resueltos.
                         break;
                 }
             }
@@ -5213,27 +6678,27 @@ void UpdateSettingsLabels(HWND hwnd) {
     HWND hBorderLabel = GetDlgItem(hwnd, 1010);
     
     if (hOpacityLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(overlay_opacity.load());
+        std::wstring text = L"Value: " + std::to_wstring(overlay_opacity.load());
         SetWindowTextW(hOpacityLabel, text.c_str());
     }
     
     if (hZoomMinLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(zoom_min_factor.load() / 100.0f) + L"x";
+        std::wstring text = L"Value: " + std::to_wstring(zoom_min_factor.load() / 100.0f) + L"x";
         SetWindowTextW(hZoomMinLabel, text.c_str());
     }
     
     if (hZoomMaxLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(zoom_max_factor.load() / 100.0f) + L"x";
+        std::wstring text = L"Value: " + std::to_wstring(zoom_max_factor.load() / 100.0f) + L"x";
         SetWindowTextW(hZoomMaxLabel, text.c_str());
     }
     
     if (hCursorLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(text_cursor_blink_speed.load()) + L"ms";
+        std::wstring text = L"Value: " + std::to_wstring(text_cursor_blink_speed.load()) + L"ms";
         SetWindowTextW(hCursorLabel, text.c_str());
     }
     
     if (hBorderLabel) {
-        std::wstring text = L"Valor: " + std::to_wstring(region_border_thickness.load()) + L"px";
+        std::wstring text = L"Value: " + std::to_wstring(region_border_thickness.load()) + L"px";
         SetWindowTextW(hBorderLabel, text.c_str());
     }
 }
@@ -5271,7 +6736,7 @@ void UpdateSliderPositions(HWND hwnd) {
 void ApplyConfigurationChanges() {
     // Forzar redibujada del overlay principal para aplicar todos los cambios
     // La opacidad se aplica automáticamente en DrawOverlay usando overlay_opacity
-    needsRedraw.store(true);
+    RequestOverlayRedraw();
     
     // Aplicar cambios a la ventana de configuración si está activa
     if (settings_overlay_active.load()) {
@@ -5301,15 +6766,15 @@ void ResetToDefaultSettings() {
 
 // Función para registrar hotkeys
 bool RegisterHotkeys() {
-    printf("  🔑 Registrando hotkey Shift+Alt+X...\n");
+    LogDebug("  🔑 Registrando hotkey Shift+Alt+X...\n");
     
     // Shift+Alt+X
     if (!RegisterHotKey(hMainWnd, 1, MOD_SHIFT | MOD_ALT, 'X')) {
-        printf("  ❌ Error al registrar hotkey Shift+Alt+X\n");
+        LogDebug("  ❌ Error al registrar hotkey Shift+Alt+X\n");
         return false;
     }
     
-    printf("  ✅ Hotkey Shift+Alt+X registrado exitosamente\n");
+    LogDebug("  ✅ Hotkey Shift+Alt+X registrado exitosamente\n");
     return true;
 }
 
@@ -5317,26 +6782,26 @@ bool RegisterHotkeys() {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
                 case WM_HOTKEY:
-            printf("🔥 Hotkey recibido: %d\n", (int)wParam);
+            LogDebug("🔥 Hotkey recibido: %d\n", (int)wParam);
             switch (wParam) {
                 case 1: // Shift+Alt+X
-                    printf("🎯 Hotkey Shift+Alt+X presionado\n");
+                    LogDebug("🎯 Hotkey Shift+Alt+X presionado\n");
                     if (!overlay_active.load()) {
-                        printf("🚀 Iniciando thread de overlay...\n");
+                        LogDebug("🚀 Iniciando thread de overlay...\n");
                         std::thread overlay_thread(ShowOverlay);
                         overlay_thread.detach();
                     } else {
-                        printf("📸 Overlay active - Activating screenshot mode\n");
+                        LogDebug("📸 Overlay active - Activating screenshot mode\n");
                         // Activar modo captura de pantalla cuando el overlay ya está activo
                         screenshot_mode.store(true);
                         drawing_active.store(false);
                         current_drawing_tool.store(DrawingTool::None);
                         text_input_mode.store(false);
-                        needsRedraw.store(true);
+                        RequestOverlayRedraw();
                     }
                     break;
                 default:
-                    printf("❓ Hotkey desconocido: %d\n", (int)wParam);
+                    LogDebug("❓ Hotkey desconocido: %d\n", (int)wParam);
                     break;
             }
             break;
@@ -5369,40 +6834,48 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     break;
                     
                 case MENU_ENABLE_AUTOSTART_ID: // Habilitar Auto-Inicio
-                    printf("🚀 Enabling auto-start on login...\n");
+                    LogDebug("🚀 Enabling auto-start on login...\n");
+                    // Se levanta la marca antes de actuar: aunque el registro
+                    // falle, el proximo arranque volvera a intentarlo.
+                    autostart_user_disabled.store(0);
+                    SaveConfiguration();
                     if (EnableAutoStart()) {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Auto-start enabled successfully.\n\n"
                             L"The application will run automatically every time you log into Windows.",
-                            L"Auto-Start Enabled", 
+                            L"Auto-Start Enabled",
                             MB_OK | MB_ICONINFORMATION);
                     } else {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Error enabling auto-start.\n\n"
                             L"Please verify that you have administrator privileges.",
-                            L"Error", 
+                            L"Error",
                             MB_OK | MB_ICONERROR);
                     }
                     break;
-                    
+
                 case MENU_DISABLE_AUTOSTART_ID: // Deshabilitar Auto-Inicio
-                    printf("🚫 Disabling auto-start on login...\n");
+                    LogDebug("🚫 Disabling auto-start on login...\n");
+                    // Sin esta marca el propio arranque siguiente volveria a
+                    // registrar el auto-inicio y desharia la decision.
+                    autostart_user_disabled.store(1);
+                    SaveConfiguration();
                     if (DisableAutoStart()) {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Auto-start disabled successfully.\n\n"
                             L"The application will no longer run automatically when logging in.",
-                            L"Auto-Start Disabled", 
+                            L"Auto-Start Disabled",
                             MB_OK | MB_ICONINFORMATION);
                     } else {
-                        MessageBoxW(hMainWnd, 
+                        MessageBoxW(hMainWnd,
                             L"Error disabling auto-start.",
-                            L"Error", 
+                            L"Error",
                             MB_OK | MB_ICONERROR);
                     }
                     break;
                     
                 case 1007: // Estado del Auto-Inicio
-                    printf("🔍 Showing detailed auto-start status...\n");
+                    LogDebug("🔍 Showing detailed auto-start status...\n");
                     ShowAutoStartStatus();
                     MessageBoxW(hMainWnd, 
                         L"Detailed auto-start status information has been displayed in the console.\n\n"
@@ -5462,20 +6935,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             
         case WM_TIMER:
             if (wParam == 1) { // Timer de verificación del system tray
-                printf("⏰ Verificando estado del system tray...\n");
+                LogDebug("⏰ Verificando estado del system tray...\n");
                 
                 // Verificar si el icono del system tray está visible
                 if (systemTrayInitialized) {
                     // Enviar mensaje de prueba al system tray
                     if (!Shell_NotifyIcon(NIM_MODIFY, &nid)) {
-                        printf("⚠️ Icono del system tray no responde - Restaurando...\n");
+                        LogDebug("⚠️ Icono del system tray no responde - Restaurando...\n");
                         if (RestoreSystemTrayIcon()) {
-                            printf("✅ System tray restaurado por timer\n");
+                            LogDebug("✅ System tray restaurado por timer\n");
                         } else {
-                            printf("❌ Error al restaurar system tray por timer\n");
+                            LogDebug("❌ Error al restaurar system tray por timer\n");
                         }
                     } else {
-                        printf("✅ System tray responde correctamente\n");
+                        LogDebug("✅ System tray responde correctamente\n");
                     }
                 }
             }
@@ -5535,80 +7008,85 @@ bool RequestAdminPrivileges() {
 
 // Función para mostrar información detallada del estado del auto-inicio
 void ShowAutoStartStatus() {
-    printf("\n🔍 === ESTADO DETALLADO DEL AUTO-INICIO ===\n");
+    LogDebug("\n🔍 === ESTADO DETALLADO DEL AUTO-INICIO ===\n");
     
     // Verificar permisos de administrador
     bool isAdmin = IsRunningAsAdministrator();
-    printf("👤 Administrator privileges: %s\n", isAdmin ? "✅ YES" : "❌ NO");
+    LogDebug("👤 Administrator privileges: %s\n", isAdmin ? "✅ YES" : "❌ NO");
     
-    // Verificar si está habilitado
-    bool isEnabled = IsAutoStartEnabled();
-    printf("🚀 Auto-start enabled: %s\n", isEnabled ? "✅ YES" : "❌ NO");
-    
-    // Mostrar información del registro
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, 
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 
-        0, KEY_READ, &hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        printf("📋 Clave del registro: ✅ Accesible\n");
-        
-        if (isEnabled) {
+    // Desglose por mecanismo: la tarea programada es la que realmente arranca la
+    // aplicacion elevada, la entrada del registro es solo el respaldo.
+    bool taskEnabled = IsScheduledTaskAutoStartEnabled();
+    LogDebug("🗓️ Tarea programada '%ls': %s\n", AUTOSTART_TASK_NAME,
+             taskEnabled ? "✅ REGISTRADA" : "❌ AUSENTE");
+
+    bool registryEnabled = IsRegistryAutoStartEnabled();
+    LogDebug("📋 Entrada HKCU\\...\\Run: %s\n",
+             registryEnabled ? "✅ PRESENTE" : "❌ AUSENTE");
+
+    LogDebug("🚀 Auto-start enabled: %s\n",
+             (taskEnabled || registryEnabled) ? "✅ YES" : "❌ NO");
+    LogDebug("🙋 Desactivado por el usuario: %s\n",
+             autostart_user_disabled.load() != 0 ? "✅ SI" : "❌ NO");
+
+    // Ruta registrada en el respaldo del registro, para detectar un .exe movido.
+    if (registryEnabled) {
+        HKEY hKey;
+        LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_REGISTRY_KEY,
+                                    0, KEY_READ, &hKey);
+        if (result == ERROR_SUCCESS) {
             wchar_t valueData[MAX_PATH];
             DWORD dataSize = sizeof(valueData);
             DWORD dataType = REG_SZ;
-            
-            result = RegQueryValueExW(hKey, L"Screen Highlighter", NULL, &dataType, 
-                                     (LPBYTE)valueData, &dataSize);
-            
+
+            result = RegQueryValueExW(hKey, AUTOSTART_REGISTRY_VALUE, NULL,
+                                      &dataType, (LPBYTE)valueData, &dataSize);
             if (result == ERROR_SUCCESS) {
-                printf("📁 Ruta en el registro: %ls\n", valueData);
-                
-                // Verificar si el archivo existe
-                DWORD fileAttributes = GetFileAttributesW(valueData);
-                if (fileAttributes != INVALID_FILE_ATTRIBUTES) {
-                    printf("✅ Archivo ejecutable: Existe y es accesible\n");
+                LogDebug("📁 Ruta en el registro: %ls\n", valueData);
+                if (GetFileAttributesW(valueData) != INVALID_FILE_ATTRIBUTES) {
+                    LogDebug("✅ Archivo ejecutable: Existe y es accesible\n");
                 } else {
-                    printf("❌ Archivo ejecutable: No existe o no es accesible\n");
+                    LogDebug("❌ Archivo ejecutable: No existe o no es accesible\n");
                 }
             } else {
-                printf("❌ Error al leer valor del registro: %ld\n", result);
+                LogDebug("❌ Error al leer valor del registro: %ld\n", result);
             }
+            RegCloseKey(hKey);
+        } else {
+            LogDebug("📋 Clave del registro: ❌ No accesible (Error: %ld)\n", result);
         }
-        
-        RegCloseKey(hKey);
-    } else {
-        printf("📋 Clave del registro: ❌ No accesible (Error: %ld)\n", result);
     }
-    
+
     // Mostrar ruta actual del ejecutable
     wchar_t currentExePath[MAX_PATH];
     if (GetModuleFileNameW(NULL, currentExePath, MAX_PATH) > 0) {
-        printf("📁 Ruta actual del ejecutable: %ls\n", currentExePath);
+        LogDebug("📁 Ruta actual del ejecutable: %ls\n", currentExePath);
     } else {
-        printf("❌ No se pudo obtener la ruta del ejecutable\n");
+        LogDebug("❌ No se pudo obtener la ruta del ejecutable\n");
     }
     
-    printf("===========================================\n\n");
+    LogDebug("===========================================\n\n");
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow; // Parámetros no utilizados
     
-    printf("🚀 Iniciando Screen Highlighter...\n");
+    // Debe hacerse antes de crear cualquier ventana o consultar metricas.
+    EnablePerMonitorDpiAwareness();
+
+    LogDebug("🚀 Iniciando Screen Highlighter...\n");
     
     // Verificar permisos de administrador
     if (!IsRunningAsAdministrator()) {
-        printf("⚠️ Application requires administrator privileges\n");
-        printf("🔐 Requesting privilege elevation...\n");
+        LogDebug("⚠️ Application requires administrator privileges\n");
+        LogDebug("🔐 Requesting privilege elevation...\n");
         
         if (RequestAdminPrivileges()) {
-            printf("✅ Administrator privileges requested successfully\n");
-            printf("🔄 Closing current instance...\n");
+            LogDebug("✅ Administrator privileges requested successfully\n");
+            LogDebug("🔄 Closing current instance...\n");
             return 0; // Cerrar esta instancia
         } else {
-            printf("❌ Could not obtain administrator privileges\n");
+            LogDebug("❌ Could not obtain administrator privileges\n");
             MessageBoxW(NULL, 
                 L"Screen Highlighter requires administrator privileges to function correctly.\n\n"
                 L"Please run the application as administrator.",
@@ -5618,25 +7096,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
     
-    printf("✅ Administrator privileges verified\n");
+    LogDebug("✅ Administrator privileges verified\n");
     
     // Cargar configuración desde archivo .ini al inicio
+    MigrateLegacyConfig();
     LoadConfiguration();
-    printf("✅ Configuration loaded\n");
+    LogDebug("✅ Configuration loaded\n");
     
     // Aplicar configuraciones del modo de recursos
-    printf("🎯 Aplicando configuraciones del modo de recursos...\n");
+    LogDebug("🎯 Aplicando configuraciones del modo de recursos...\n");
     ApplyResourceModeSettings();
     
+    // Inicializar GDI+ (decodificacion de GIF y codificacion de PNG)
+    if (!InitializeGdiPlus()) {
+        LogDebug("No se pudo inicializar GDI+: sin soporte de GIF ni guardado PNG\n");
+    }
+
     // Inicializar cache de recursos GDI para optimización de performance
-    printf("🔧 Inicializando cache de recursos GDI...\n");
+    LogDebug("🔧 Inicializando cache de recursos GDI...\n");
     GdiCache::InitializeCache();
-    printf("✅ Cache de recursos GDI inicializado\n");
+    LogDebug("✅ Cache de recursos GDI inicializado\n");
     
     // Pre-allocar vectores para mejor performance
-    printf("🔧 Pre-allocando vectores...\n");
+    LogDebug("🔧 Pre-allocando vectores...\n");
     PreAllocateVectors();
-    printf("✅ Vectores pre-allocados\n");
+    LogDebug("✅ Vectores pre-allocados\n");
                 
     // Crear una ventana oculta para manejar mensajes
     WNDCLASSEXW wc = {};
@@ -5648,10 +7132,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hIconSm = LoadIconFromFile(TRAY_ICON_SMALL);
     
                 if (!RegisterClassExW(&wc)) {
-        printf("❌ Error al registrar clase principal\n");
+        LogDebug("❌ Error al registrar clase principal\n");
         return 1;
     }
-    printf("✅ Clase principal registrada\n");
+    LogDebug("✅ Clase principal registrada\n");
     
     // Registrar clase para el overlay
     WNDCLASSEXW wcOverlay = {};
@@ -5662,10 +7146,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcOverlay.hCursor = LoadCursor(NULL, IDC_CROSS);
     
     if (!RegisterClassExW(&wcOverlay)) {
-        printf("❌ Error al registrar clase overlay\n");
+        LogDebug("❌ Error al registrar clase overlay\n");
         return 1;
     }
-    printf("✅ Clase overlay registrada\n");
+    LogDebug("✅ Clase overlay registrada\n");
     
     // Registrar clase para la ventana de configuración
     WNDCLASSEXW wcSettings = {};
@@ -5678,10 +7162,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcSettings.hIconSm = LoadIconFromFile(TRAY_ICON_SMALL);
     
     if (!RegisterClassExW(&wcSettings)) {
-        printf("❌ Error al registrar clase settings\n");
+        LogDebug("❌ Error al registrar clase settings\n");
         return 1;
     }
-    printf("✅ Clase settings registrada\n");
+    LogDebug("✅ Clase settings registrada\n");
     
     hMainWnd = CreateWindowExW(
         0,
@@ -5693,55 +7177,60 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     );
     
     if (!hMainWnd) {
-        printf("❌ Error al crear ventana principal\n");
+        LogDebug("❌ Error al crear ventana principal\n");
         return 1;
     }
-    printf("✅ Ventana principal creada\n");
+    LogDebug("✅ Ventana principal creada\n");
     
     // Ocultar la ventana
     ShowWindow(hMainWnd, SW_HIDE);
     
     // Agregar icono al system tray
-    printf("🔧 Agregando icono al system tray...\n");
+    LogDebug("🔧 Agregando icono al system tray...\n");
     if (!AddToSystemTray()) {
-        printf("❌ Error al agregar icono al system tray\n");
-        MessageBoxW(NULL, L"Error al agregar icono al system tray", L"Error", MB_OK | MB_ICONERROR);
+        LogDebug("❌ Error al agregar icono al system tray\n");
+        MessageBoxW(NULL, L"Could not add the system tray icon", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-    printf("✅ Icono agregado al system tray\n");
+    LogDebug("✅ Icono agregado al system tray\n");
     
     // Registrar hotkeys
-    printf("🔧 Registrando hotkeys...\n");
+    LogDebug("🔧 Registrando hotkeys...\n");
     if (!RegisterHotkeys()) {
-        printf("❌ Error al registrar hotkeys\n");
-        MessageBoxW(NULL, L"Error al registrar hotkeys", L"Error", MB_OK | MB_ICONERROR);
+        LogDebug("❌ Error al registrar hotkeys\n");
+        MessageBoxW(NULL, L"Could not register the hotkeys", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-    printf("✅ Hotkeys registrados\n");
+    LogDebug("✅ Hotkeys registrados\n");
     
-    // Verificar estado de auto-ejecución
-    if (IsAutoStartEnabled()) {
-        printf("🚀 Auto-start on login: ENABLED\n");
-    } else {
-        printf("🚫 Auto-start on login: DISABLED\n");
-    }
-    
-    // Mostrar estado detallado del auto-inicio
-    ShowAutoStartStatus();
-    
+    // Asegurar que la aplicación arranca con Windows.
+    // Va en un hilo aparte porque consulta y registra la tarea programada
+    // lanzando schtasks.exe, y eso retrasaria el arranque unas decimas de
+    // segundo. El hilo no toca ventanas ni recursos GDI, solo el registro y el
+    // planificador de tareas, asi que puede sobrevivir por su cuenta.
+    LogDebug("🔧 Configurando auto-inicio con Windows...\n");
+    std::thread([]() {
+        EnsureAutoStartConfigured();
+#ifdef DEBUG_BUILD
+        // Solo aporta con LogDebug activo: en release volveria a lanzar
+        // schtasks para escribir en el vacio.
+        ShowAutoStartStatus();
+#endif
+    }).detach();
+
     // Iniciar monitoreo de explorer.exe para restauración automática del system tray
-    printf("🔍 Iniciando monitoreo de explorer.exe...\n");
+    LogDebug("🔍 Iniciando monitoreo de explorer.exe...\n");
     StartExplorerMonitoring();
-    printf("✅ Monitoreo de explorer.exe iniciado\n");
+    LogDebug("✅ Monitoreo de explorer.exe iniciado\n");
     
     // Configurar timer para verificar periódicamente el system tray
     SetTimer(hMainWnd, 1, 30000, NULL); // Verificar cada 30 segundos
-    printf("⏰ System tray verification timer configured\n");
+    LogDebug("⏰ System tray verification timer configured\n");
     
     // Bucle principal del mensaje
-    printf("🔄 Starting main message loop...\n");
-    printf("💡 Press Shift+Alt+X to activate highlight\n");
-    printf("💡 Look for the green icon in the system tray\n");
+    LogDebug("🔄 Starting main message loop...\n");
+    LogDebug("💡 Press Shift+Alt+X to activate highlight\n");
+    LogDebug("💡 Look for the green icon in the system tray\n");
     
     MSG msg;
     while (running.load() && GetMessage(&msg, NULL, 0, 0)) {
@@ -5756,16 +7245,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(hMainWnd, 1);
     
     // Detener monitoreo de explorer.exe
-    printf("🛑 Deteniendo monitoreo de explorer.exe...\n");
+    LogDebug("🛑 Deteniendo monitoreo de explorer.exe...\n");
     StopExplorerMonitoring();
     
     // Remover del system tray
     RemoveFromSystemTray();
     
     // Limpiar cache de recursos GDI
-    printf("🧹 Limpiando cache de recursos GDI...\n");
+    LogDebug("🧹 Limpiando cache de recursos GDI...\n");
     GdiCache::CleanupCache();
-    printf("✅ Cache de recursos GDI limpiado\n");
+
+    // Cerrar GDI+ despues de liberar todo lo que pueda depender de el.
+    ShutdownGdiPlus();
+    LogDebug("✅ Cache de recursos GDI limpiado\n");
     
     return 0;
 }
